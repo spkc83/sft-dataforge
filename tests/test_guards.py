@@ -6,6 +6,7 @@ from dataforge.guards import (
     heldout_leaks,
     is_heldout_text,
     leakage_report,
+    secondary_field_leaks,
     word_ngrams,
 )
 
@@ -67,3 +68,32 @@ def test_leakage_report_clean_when_disjoint() -> None:
     assert report["group_split_leak_count"] == 0
     assert report["heldout_exact_leaks"] == []
     assert report["heldout_ngram_leaks"] == []
+
+
+def test_secondary_field_leaks_catches_reuse_under_distinct_groups() -> None:
+    splits = {
+        "train": [{"group_id": "state-family|train", "current_text": "explain that policy again"}],
+        "test": [{"group_id": "state-family|test", "current_text": "explain that policy again"}],
+    }
+    leaks = secondary_field_leaks(splits, "current_text")
+    assert len(leaks) == 1
+    (values,) = leaks.values()
+    assert values == ["test", "train"]
+
+
+def test_secondary_field_leaks_ignores_missing_or_blank_values() -> None:
+    splits = {
+        "train": [{"group_id": "g1"}],  # no current_text field at all
+        "test": [{"group_id": "g2", "current_text": "   "}],
+    }
+    assert secondary_field_leaks(splits, "current_text") == {}
+
+
+def test_leakage_report_secondary_leak_fields_produces_gate_ready_keys() -> None:
+    splits = {
+        "train": [{"group_id": "g1", "current_text": "same text"}],
+        "test": [{"group_id": "g2", "current_text": "same text"}],
+    }
+    report = leakage_report(splits, secondary_leak_fields=("current_text",))
+    assert report["current_text_split_leak_count"] == 1
+    assert report["group_split_leak_count"] == 0  # groups are genuinely distinct

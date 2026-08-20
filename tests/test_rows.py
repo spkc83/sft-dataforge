@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from dataforge.rows import make_row, normalize_text, render_context
+from dataforge.rows import (
+    DERIVED_FIELDS,
+    canonical_json_bytes,
+    make_row,
+    normalize_text,
+    rederive_text,
+    render_context,
+    validate_row_consistency,
+)
 
 
 def test_render_context_current_only() -> None:
@@ -111,3 +119,74 @@ def test_make_row_extra_fields_and_pair_metadata() -> None:
     assert row["pair_target"] == "card"
     assert row["pair_family"] == "family-a"
     assert row["tool_names"] == ["list_accounts"]
+
+
+def test_canonical_json_bytes_sorts_keys() -> None:
+    assert canonical_json_bytes({"b": 1, "a": 2}) == b'{"a":2,"b":1}'
+
+
+def test_derived_fields_declares_text_depends_on_current_text() -> None:
+    assert "current_text" in DERIVED_FIELDS["text"]
+    assert "history" in DERIVED_FIELDS["text"]
+    assert "prior_state" in DERIVED_FIELDS["text"]
+
+
+def test_rederive_text_resyncs_after_current_text_edit() -> None:
+    row = make_row(
+        current="what is the overdraft policy",
+        labels={},
+        example_kind="k",
+        source="s",
+        source_split="train",
+        group_id="g1",
+    )
+    row["current_text"] = "how long is the overdraft grace period"
+    rederive_text(row)
+    assert row["text"] == "[CURRENT_USER]\nhow long is the overdraft grace period"
+
+
+def test_rederive_text_respects_history_and_state() -> None:
+    row = make_row(
+        current="freeze it",
+        history=[
+            {"role": "user", "content": "what's my balance"},
+            {"role": "assistant", "content": "It's $100."},
+        ],
+        prior_state={"pending_servicing": "view_balance"},
+        labels={},
+        example_kind="k",
+        source="s",
+        source_split="train",
+        group_id="g1",
+    )
+    row["current_text"] = "cancel it instead"
+    rederive_text(row)
+    assert "[CURRENT_USER]\ncancel it instead" in row["text"]
+    assert "[PREVIOUS_USER]\nwhat's my balance" in row["text"]
+    assert row["has_context"] is True
+
+
+def test_validate_row_consistency_passes_for_a_fresh_row() -> None:
+    row = make_row(
+        current="what is the overdraft policy",
+        labels={},
+        example_kind="k",
+        source="s",
+        source_split="train",
+        group_id="g1",
+    )
+    validate_row_consistency(row)  # no raise
+
+
+def test_validate_row_consistency_rejects_stale_text() -> None:
+    row = make_row(
+        current="what is the overdraft policy",
+        labels={},
+        example_kind="k",
+        source="s",
+        source_split="train",
+        group_id="g1",
+    )
+    row["current_text"] = "a completely different question"  # text not re-rendered
+    with pytest.raises(ValueError, match="inconsistent"):
+        validate_row_consistency(row)

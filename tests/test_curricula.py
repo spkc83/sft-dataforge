@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from typing import Any
+
 import pytest
 
-from dataforge.curricula import Registry, compose
+from dataforge.curricula import DEFAULT_DEDUP_PRIORITY, Registry, build_report, compose
 
 
 def _row(
-    text: str, group_id: str, trajectory_id: str | None = None, pair_id: str | None = None
+    text: str,
+    group_id: str,
+    trajectory_id: str | None = None,
+    pair_id: str | None = None,
+    current_text: str | None = None,
 ) -> dict:
     return {
         "text": text,
+        "current_text": current_text if current_text is not None else text,
         "group_id": group_id,
         "trajectory_id": trajectory_id or group_id,
         "pair_id": pair_id,
@@ -98,3 +106,194 @@ def test_held_out_texts_flagged_when_leaked_into_train() -> None:
         held_out_texts=["this is a held out phrase"],
     )
     assert report["leakage"]["heldout_exact_leaks"]
+
+
+def test_dedup_priority_default_is_a_fixed_constant_not_derived_from_split_order() -> None:
+    """Reordering split_order (a cosmetic/emission-order knob) must never
+    silently flip which split wins deduplication -- the default dedup
+    priority is a fixed constant independent of split_order's permutation."""
+    registry = Registry()
+
+    @registry.register("dupes", splits=("train", "validation", "test"))
+    def dupes(split: str) -> list[dict]:
+        return [_row("duplicate text here", f"g-{split}")]
+
+    for order in [
+        ("train", "validation", "test"),
+        ("test", "train", "validation"),
+        ("validation", "test", "train"),
+    ]:
+        splits, _ = compose({k: [] for k in order}, registry, split_order=order)
+        kept = {k for k, v in splits.items() if v}
+        assert kept == {"test"}, f"split_order={order} flipped dedup winner to {kept}"
+
+
+def test_dedup_priority_must_be_permutation_of_split_order() -> None:
+    registry = Registry()
+
+    @registry.register("dupes", splits=("train", "validation", "test", "holdout"))
+    def dupes(split: str) -> list[dict]:
+        return [_row("duplicate text here", f"g-{split}")]
+
+    with pytest.raises(ValueError, match="dedup_priority"):
+        compose(
+            {"train": [], "validation": [], "test": [], "holdout": []},
+            registry,
+            split_order=("train", "validation", "test", "holdout"),
+            dedup_priority=DEFAULT_DEDUP_PRIORITY,  # only ("test","validation","train")
+        )
+
+
+def test_dedup_priority_required_explicitly_for_nonstandard_split_names() -> None:
+    registry = Registry()
+
+    @registry.register("dupes", splits=("train", "holdout"))
+    def dupes(split: str) -> list[dict]:
+        return [_row("duplicate text here", f"g-{split}")]
+
+    with pytest.raises(ValueError, match="dedup_priority"):
+        compose({"train": [], "holdout": []}, registry, split_order=("train", "holdout"))
+
+    # explicit dedup_priority works fine
+    splits, _ = compose(
+        {"train": [], "holdout": []},
+        registry,
+        split_order=("train", "holdout"),
+        dedup_priority=("holdout", "train"),
+    )
+    assert {k for k, v in splits.items() if v} == {"holdout"}
+
+
+def test_current_text_secondary_leak_catches_state_conditioned_reuse() -> None:
+    """A state-conditioned followup can render very differently in `text`
+    (a state prefix differs per split) while reusing the identical
+    `current_text` across splits under deliberately distinct group ids --
+    the group/trajectory checks can't see this; the secondary leak check on
+    current_text (on by default) must."""
+    registry = Registry()
+
+    @registry.register("state_followup", splits=("train", "test"))
+    def state_followup(split: str) -> list[dict]:
+        return [
+            _row(
+                text=f"[PRIOR_STATE]\n{{'pending': '{split}'}}\n[CURRENT_USER]\nfollowup",
+                group_id=f"state-family|{split}",
+                current_text="can you explain that policy again",
+            )
+        ]
+
+    _, report = compose({"train": [], "validation": [], "test": []}, registry)
+    assert report["leakage"]["current_text_split_leak_count"] == 1
+    assert report["leakage"]["group_split_leak_count"] == 0  # groups genuinely differ
+
+
+def test_secondary_leak_fields_is_configurable() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train", "test"))
+    def r(split: str) -> list[dict]:
+        return [_row(f"unique text {split}", f"g-{split}", current_text="shared current text")]
+
+    _, report_off = compose(
+        {"train": [], "validation": [], "test": []}, registry, secondary_leak_fields=()
+    )
+    assert "current_text_split_leak_count" not in report_off["leakage"]
+
+
+def test_extra_leak_checks_hook_merges_into_leakage() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train",))
+    def r(split: str) -> list[dict]:
+        return [_row("a", "g1")]
+
+    def custom_check(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping[str, Any]:
+        return {"custom_split_leaks": {}, "custom_split_leak_count": 0}
+
+    _, report = compose(
+        {"train": [], "validation": [], "test": []},
+        registry,
+        extra_leak_checks=[custom_check],
+    )
+    assert report["leakage"]["custom_split_leak_count"] == 0
+
+
+def test_extra_leak_checks_reject_colliding_keys() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train",))
+    def r(split: str) -> list[dict]:
+        return [_row("a", "g1")]
+
+    def colliding_check(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping[str, Any]:
+        return {"group_split_leak_count": 999}
+
+    with pytest.raises(ValueError, match="colliding"):
+        compose(
+            {"train": [], "validation": [], "test": []},
+            registry,
+            extra_leak_checks=[colliding_check],
+        )
+
+
+def test_pii_fields_none_scans_every_string_field() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train",))
+    def r(split: str) -> list[dict]:
+        row = _row("clean text", "g1")
+        row["assistant_response"] = "call me at 555-123-4567"
+        return [row]
+
+    _, report = compose({"train": [], "validation": [], "test": []}, registry)
+    assert report["pii_matches"] > 0
+
+
+def test_pii_fields_explicit_list_restricts_scan() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train",))
+    def r(split: str) -> list[dict]:
+        row = _row("clean text", "g1")
+        row["assistant_response"] = "call me at 555-123-4567"
+        return [row]
+
+    _, report = compose(
+        {"train": [], "validation": [], "test": []}, registry, pii_fields=("text",)
+    )
+    assert report["pii_matches"] == 0
+
+
+def test_seed_split_outside_split_order_raises() -> None:
+    registry = Registry()
+    seed = {
+        "train": [],
+        "validation": [],
+        "test": [],
+        "calibration": [_row("calibration probe utterance", "cal|0")],
+    }
+    with pytest.raises(ValueError, match="calibration"):
+        compose(seed, registry)
+
+
+def test_curriculum_split_outside_split_order_raises() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train", "calibration"))
+    def r(split: str) -> list[dict]:
+        return [_row(f"text {split}", f"g-{split}")]
+
+    with pytest.raises(ValueError, match="calibration"):
+        compose({"train": [], "validation": [], "test": []}, registry)
+
+
+def test_build_report_contract_and_fingerprint() -> None:
+    splits = {"train": [_row("a", "g1")], "validation": [], "test": []}
+    report = build_report(splits)
+    assert report["contract"] == "dataforge-curriculum-report"
+    assert report["splits_fingerprint"].startswith("sha256:")
+    # a fresh build over identical content reproduces the same fingerprint
+    assert build_report(splits)["splits_fingerprint"] == report["splits_fingerprint"]
+    # mutating a row's content changes the fingerprint
+    splits["train"][0]["text"] = "a changed"
+    assert build_report(splits)["splits_fingerprint"] != report["splits_fingerprint"]
