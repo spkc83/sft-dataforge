@@ -7,17 +7,32 @@ enforces that boundary with a hash over everything *except* those fields:
 if the hash changes after a teacher response is applied, the response is
 rejected.
 
-That boundary has a gap if one of the editable fields is itself a
-*dependency* of a derived field the hash also treats as immutable (e.g.
+That boundary has a gap if an editable field is, or is a *dependency* of, a
+derived field the hash would otherwise treat as immutable (e.g.
 ``dataforge.rows.make_row``'s rendered ``text`` is derived from
-``current_text``): editing the dependency without recomputing the derivative
-leaves the derivative stale, and the hash -- which only ever compares
-top-level dict keys -- cannot see that the two have drifted apart. This
-module closes that gap two ways: by default it refuses an ``editable_fields``
-set that affects a known derived field unless the caller also supplies a
-``rederive`` callback (see :data:`dataforge.rows.DERIVED_FIELDS`), and it
-accepts an optional ``validate`` structural hook -- analogous to hello-SLM's
-``validate_records`` -- run after every edit is applied.
+``current_text``): editing the dependency -- or the derived field itself --
+without recomputing the derivative correctly leaves it stale, and the hash,
+which only ever compares top-level dict keys, cannot see that the two have
+drifted apart. Closing that gap needs two things working together, and this
+module requires both whenever a derived field is affected:
+
+* a ``rederive`` callback (see :data:`dataforge.rows.rederive_text`) that
+  recomputes the derived field from the (possibly just-edited) fields it
+  depends on; and
+* a ``validate`` structural check (see
+  :data:`dataforge.rows.validate_row_consistency`) -- analogous to
+  hello-SLM's ``validate_records`` -- run after ``rederive``, so a
+  ``rederive`` that is present but wrong (a no-op stub, a bug, or just the
+  wrong function) is caught rather than silently trusted. Only the fields
+  ``rederive`` is actually responsible for (the *affected* derived fields)
+  are excluded from the immutable-hash comparison -- passing a `rederive`
+  defensively, for editable fields that don't affect anything, never widens
+  what the hash ignores.
+
+``validate`` defaults to :func:`dataforge.rows.validate_row_consistency`
+whenever it's needed and the default :data:`dataforge.rows.DERIVED_FIELDS`
+map is in use; callers using a custom ``derived_fields`` map must supply
+their own ``validate`` explicitly.
 """
 
 from __future__ import annotations
@@ -28,7 +43,14 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from dataforge.rows import DERIVED_FIELDS, canonical_json_bytes
+from dataforge.rows import DERIVED_FIELDS, canonical_json_bytes, validate_row_consistency
+
+#: Sentinel default for `validate`: resolves to `validate_row_consistency`
+#: when it's required and the default DERIVED_FIELDS map is in use, else to
+#: None. Passing `validate=None` explicitly is a deliberate opt-out attempt
+#: and is refused (not silently honored) whenever a derived field is
+#: affected -- see `_resolve_wiring`.
+_AUTO_VALIDATE = object()
 
 
 class TeacherRealizationError(ValueError):
@@ -50,23 +72,57 @@ def _affected_derived_fields(
     editable_fields: Sequence[str],
     derived_fields: Mapping[str, Sequence[str]],
 ) -> set[str]:
+    """Derived fields an edit to ``editable_fields`` could invalidate.
+
+    A derived field is affected if it is itself editable (a caller could
+    hand-edit it directly, out of sync with its inputs) or if any of its
+    declared dependencies is editable.
+    """
     editable = set(editable_fields)
-    return {derived for derived, deps in derived_fields.items() if editable & set(deps)}
+    return {
+        derived
+        for derived, deps in derived_fields.items()
+        if derived in editable or editable & set(deps)
+    }
 
 
-def _check_derivation_wiring(
+def _resolve_wiring(
     editable_fields: Sequence[str],
     derived_fields: Mapping[str, Sequence[str]],
     rederive: Callable[[dict[str, Any]], None] | None,
-) -> None:
+    validate: Callable[[Mapping[str, Any]], None] | None,
+) -> tuple[tuple[str, ...], Callable[[Mapping[str, Any]], None] | None]:
+    """Validate rederive/validate wiring; return (excluded_fields, validate).
+
+    ``excluded_fields`` -- the fields the immutable hash ignores -- is
+    always ``editable_fields`` plus only the *affected* derived fields
+    (never the full ``derived_fields`` map), so an unrelated, defensively
+    passed ``rederive`` never widens the hash's blind spot.
+    """
     affected = _affected_derived_fields(editable_fields, derived_fields)
-    if affected and rederive is None:
-        raise TeacherRealizationError(
-            f"editable_fields {sorted(set(editable_fields))} affect derived field(s) "
-            f"{sorted(affected)}; pass a `rederive` callback that recomputes them (e.g. "
-            "dataforge.rows.rederive_text), or drop those fields from editable_fields, or "
-            "pass derived_fields={} to opt out of this check"
+    if validate is _AUTO_VALIDATE:
+        validate = (
+            validate_row_consistency if affected and derived_fields is DERIVED_FIELDS else None
         )
+    if affected:
+        if rederive is None:
+            raise TeacherRealizationError(
+                f"editable_fields {sorted(set(editable_fields))} affect derived field(s) "
+                f"{sorted(affected)}; pass a `rederive` callback that recomputes them (e.g. "
+                "dataforge.rows.rederive_text), or drop those fields from editable_fields, or "
+                "pass derived_fields={} to opt out of this check"
+            )
+        if validate is None:
+            raise TeacherRealizationError(
+                f"editable_fields {sorted(set(editable_fields))} affect derived field(s) "
+                f"{sorted(affected)}; a `rederive` callback alone is not verified to have "
+                "worked -- also pass a `validate` callback (e.g. "
+                "dataforge.rows.validate_row_consistency) to structurally confirm the derived "
+                "field(s) are consistent after the edit, or pass derived_fields={} to opt out "
+                "of this check"
+            )
+    excluded_fields = tuple(editable_fields) + tuple(sorted(affected))
+    return excluded_fields, validate
 
 
 def export_teacher_requests(
@@ -78,19 +134,19 @@ def export_teacher_requests(
     instructions: str = "Rewrite only the listed fields for fluency; do not change their meaning.",
     derived_fields: Mapping[str, Sequence[str]] = DERIVED_FIELDS,
     rederive: Callable[[dict[str, Any]], None] | None = None,
+    validate: Callable[[Mapping[str, Any]], None] | None = _AUTO_VALIDATE,  # type: ignore[assignment]
 ) -> None:
     """Write one teacher request per record: its immutable hash and current
     values of the editable fields, to be rewritten and returned unchanged
     in shape by :func:`import_teacher_responses`.
 
-    ``derived_fields``/``rederive`` must match whatever will be passed to
-    the later :func:`import_teacher_responses` call, so the two agree on
-    what is (and isn't) covered by ``immutable_hash``; see
-    :func:`_check_derivation_wiring`.
+    ``derived_fields``/``rederive``/``validate`` must match whatever will be
+    passed to the later :func:`import_teacher_responses` call, so the two
+    agree on what is (and isn't) covered by ``immutable_hash``; see
+    :func:`_resolve_wiring`.
     """
-    _check_derivation_wiring(editable_fields, derived_fields, rederive)
-    excluded_fields = tuple(editable_fields) + (
-        tuple(derived_fields) if rederive is not None else ()
+    excluded_fields, _validate = _resolve_wiring(
+        editable_fields, derived_fields, rederive, validate
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\n") as handle:
@@ -117,7 +173,7 @@ def import_teacher_responses(
     provenance_field: str = "provenance",
     derived_fields: Mapping[str, Sequence[str]] = DERIVED_FIELDS,
     rederive: Callable[[dict[str, Any]], None] | None = None,
-    validate: Callable[[Mapping[str, Any]], None] | None = None,
+    validate: Callable[[Mapping[str, Any]], None] | None = _AUTO_VALIDATE,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """Apply teacher responses, verifying the immutable hash before and after.
 
@@ -127,21 +183,18 @@ def import_teacher_responses(
     edit (and, if given, ``rederive``/``validate``) run -- either failure
     raises :class:`TeacherRealizationError`.
 
-    If any ``editable_fields`` entry is a dependency of a field in
-    ``derived_fields`` (default :data:`dataforge.rows.DERIVED_FIELDS`), a
-    ``rederive`` callback is required: it runs, mutating the record in
-    place, immediately after the editable fields are set, and the derived
-    fields it owns are excluded from the immutable-hash comparison (they are
-    *expected* to change as a function of the edit). ``validate`` is an
-    optional additional structural check -- run after ``rederive`` -- for
-    invariants no single hash can express (e.g. "the rendered text still
-    matches current_text"); it receives the fully-edited record and should
-    raise on any inconsistency, analogous to hello-SLM's ``validate_records``.
+    If any ``editable_fields`` entry is, or is a dependency of, a field in
+    ``derived_fields`` (default :data:`dataforge.rows.DERIVED_FIELDS`), both
+    a ``rederive`` callback AND a ``validate`` callback are required (see
+    the module docstring): ``rederive`` runs first, mutating the record in
+    place immediately after the editable fields are set; ``validate`` then
+    runs against the fully-edited record and must raise on any
+    inconsistency. Only the affected derived fields are excluded from the
+    immutable-hash comparison. Pass ``derived_fields={}`` to opt out of this
+    guard entirely (the caller then owns the consistency of any derived
+    field on their own).
     """
-    _check_derivation_wiring(editable_fields, derived_fields, rederive)
-    excluded_fields = tuple(editable_fields) + (
-        tuple(derived_fields) if rederive is not None else ()
-    )
+    excluded_fields, validate = _resolve_wiring(editable_fields, derived_fields, rederive, validate)
     responses = {row["record_id"]: row for row in _read_jsonl(path)}
     realized = [dict(record) for record in records]
     for record in realized:
