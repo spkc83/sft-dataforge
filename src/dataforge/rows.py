@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from typing import Any
 
 PRIOR_STATE_TAG = "[PRIOR_STATE]"
 CURRENT_USER_TAG = "[CURRENT_USER]"
 PREVIOUS_ASSISTANT_TAG = "[PREVIOUS_ASSISTANT]"
 PREVIOUS_USER_TAG = "[PREVIOUS_USER]"
+
+#: Fields a make_row() row derives from other fields, mapped to the fields
+#: they're derived from. Anything editable by a teacher that overlaps one of
+#: these dependency sets must be paired with a `rederive` callback (see
+#: :func:`rederive_text`) -- otherwise the derived field goes stale silently.
+#: This is the default `derived_fields` for :mod:`dataforge.teacher`.
+DERIVED_FIELDS: dict[str, tuple[str, ...]] = {
+    "text": ("current_text", "history", "prior_state"),
+}
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
 
 
 def normalize_text(text: str) -> str:
@@ -155,3 +170,59 @@ def make_row(
     if extra:
         row.update(extra)
     return row
+
+
+def rederive_text(
+    row: MutableMapping[str, Any],
+    *,
+    max_exchanges: int = 3,
+    is_meaningful_state: Callable[[Mapping[str, Any] | None], bool] | None = None,
+) -> None:
+    """Recompute ``row["text"]``/``row["has_context"]`` from ``current_text``,
+    ``history``, and ``prior_state``.
+
+    Pass this as ``rederive`` to
+    :func:`dataforge.teacher.export_teacher_requests` /
+    :func:`dataforge.teacher.import_teacher_responses` whenever
+    ``current_text``, ``history``, or ``prior_state`` is an editable field, so
+    the rendered ``text`` a model actually trains on stays in sync with the
+    edit instead of going stale (see :data:`DERIVED_FIELDS`).
+    """
+    text, has_context = render_context(
+        str(row["current_text"]),
+        row.get("history") or (),
+        max_exchanges=max_exchanges,
+        prior_state=row.get("prior_state") or None,
+        is_meaningful_state=is_meaningful_state,
+    )
+    row["text"] = text
+    row["has_context"] = has_context
+
+
+def validate_row_consistency(
+    row: Mapping[str, Any],
+    *,
+    max_exchanges: int = 3,
+    is_meaningful_state: Callable[[Mapping[str, Any] | None], bool] | None = None,
+) -> None:
+    """Raise ``ValueError`` if ``text``/``has_context`` disagree with a fresh
+    render of ``current_text``/``history``/``prior_state``.
+
+    A structural post-edit check, analogous to hello-SLM's
+    ``validate_records``: pass as ``validate`` to
+    :func:`dataforge.teacher.import_teacher_responses` for defense in depth
+    even when a field's derivation dependency isn't declared in
+    :data:`DERIVED_FIELDS` (e.g. because a caller opted out of the
+    dependency guard).
+    """
+    expected_text, expected_has_context = render_context(
+        str(row["current_text"]),
+        row.get("history") or (),
+        max_exchanges=max_exchanges,
+        prior_state=row.get("prior_state") or None,
+        is_meaningful_state=is_meaningful_state,
+    )
+    if row.get("text") != expected_text:
+        raise ValueError("row text is inconsistent with current_text/history/prior_state")
+    if row.get("has_context") != expected_has_context:
+        raise ValueError("row has_context is inconsistent with current_text/history/prior_state")
