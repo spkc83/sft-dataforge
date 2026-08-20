@@ -79,6 +79,24 @@ def default_registry() -> Registry:
     return _DEFAULT_REGISTRY
 
 
+def _iter_strings(value: Any) -> Iterable[str]:
+    """Recursively yield every string leaf inside ``value``.
+
+    Used for PII scanning so a field that happens to be a nested dict or
+    list (e.g. ``prior_state``, ``provenance``, a ``history`` list of
+    ``{"role": ..., "content": ...}`` turns) is scanned as thoroughly as a
+    flat string field -- PII does not respect a row's schema.
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _iter_strings(item)
+    elif isinstance(value, list | tuple | set | frozenset):
+        for item in value:
+            yield from _iter_strings(item)
+
+
 def splits_fingerprint(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> str:
     """A content fingerprint over every field of every row in ``splits``.
 
@@ -128,6 +146,8 @@ def build_report(
     ngram_size: int = 4,
     heldout_excluded_splits: Sequence[str] = ("test",),
     secondary_leak_fields: Sequence[str] = ("current_text",),
+    secondary_leak_min_tokens: int = 3,
+    secondary_leak_row_predicate: Callable[[Mapping[str, Any]], bool] | None = None,
     extra_leak_checks: Sequence[LeakCheck] = (),
     pii_fields: Sequence[str] | None = None,
     cross_split_duplicates_removed: int = 0,
@@ -143,18 +163,26 @@ def build_report(
     on the post-mutation ``splits`` before calling
     :func:`dataforge.emit.write_dataset`.
 
-    ``pii_fields``: ``None`` (the default) scans every string-valued field
-    of every row for PII, not just ``text_field`` -- a teacher editing e.g.
-    an ``assistant_response`` field can introduce PII just as easily as a
-    curriculum editing ``text``. Pass an explicit field list to scan only
-    those fields.
+    ``pii_fields``: ``None`` (the default) recursively scans every string
+    leaf reachable from every field of every row for PII -- including
+    strings nested inside dict/list-valued fields like ``prior_state``,
+    ``provenance``, or ``history`` -- not just ``text_field``. A teacher
+    editing e.g. an ``assistant_response`` field, or metadata carrying a
+    free-text note, can introduce PII just as easily as a curriculum
+    editing ``text``. Pass an explicit field list to scan only those
+    fields (each is still scanned recursively, so a listed dict/list field
+    is fully covered, not just its top level).
 
     ``secondary_leak_fields``: in addition to identifier-based leakage
     (group/trajectory/pair), also flag any of these fields whose normalized
     value appears in more than one split -- even under different
     ``group_id``s. Defaults to ``("current_text",)``, restoring hello-SLM's
     state-conditioned-utterance leak coverage generically (no hardcoded
-    example-kind names or group-id prefixes required).
+    example-kind names or group-id prefixes required). ``secondary_leak_min_tokens``
+    (default ``3``) and ``secondary_leak_row_predicate`` scope this check --
+    see :func:`dataforge.guards.secondary_field_leaks` -- so short, widely
+    and legitimately reused text (e.g. a bare ``"yes"`` clarification
+    answer) doesn't trip it.
 
     ``extra_leak_checks``: additional callables, each given ``splits`` and
     returning a dict merged into ``report["leakage"]``. Lets a domain team
@@ -183,6 +211,8 @@ def build_report(
             ngram_size=ngram_size,
             heldout_excluded_splits=heldout_excluded_splits,
             secondary_leak_fields=secondary_leak_fields,
+            secondary_leak_min_tokens=secondary_leak_min_tokens,
+            secondary_leak_row_predicate=secondary_leak_row_predicate,
         )
     )
     for check in extra_leak_checks:
@@ -194,19 +224,19 @@ def build_report(
 
     if pii_fields is None:
         pii_texts: Iterable[str] = (
-            value
+            text
             for rows in splits.values()
             for row in rows
-            for value in row.values()
-            if isinstance(value, str)
+            for text in _iter_strings(row)
         )
     else:
         pii_texts = (
-            str(row[field])
+            text
             for rows in splits.values()
             for row in rows
             for field in pii_fields
-            if field in row and isinstance(row[field], str)
+            if field in row
+            for text in _iter_strings(row[field])
         )
 
     return {
@@ -235,6 +265,8 @@ def compose(
     ngram_size: int = 4,
     heldout_excluded_splits: Sequence[str] = ("test",),
     secondary_leak_fields: Sequence[str] = ("current_text",),
+    secondary_leak_min_tokens: int = 3,
+    secondary_leak_row_predicate: Callable[[Mapping[str, Any]], bool] | None = None,
     extra_leak_checks: Sequence[LeakCheck] = (),
     pii_fields: Sequence[str] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
@@ -329,6 +361,8 @@ def compose(
         ngram_size=ngram_size,
         heldout_excluded_splits=heldout_excluded_splits,
         secondary_leak_fields=secondary_leak_fields,
+        secondary_leak_min_tokens=secondary_leak_min_tokens,
+        secondary_leak_row_predicate=secondary_leak_row_predicate,
         extra_leak_checks=extra_leak_checks,
         pii_fields=pii_fields,
         cross_split_duplicates_removed=duplicates_removed,
