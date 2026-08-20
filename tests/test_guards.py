@@ -91,9 +91,50 @@ def test_secondary_field_leaks_ignores_missing_or_blank_values() -> None:
 
 def test_leakage_report_secondary_leak_fields_produces_gate_ready_keys() -> None:
     splits = {
-        "train": [{"group_id": "g1", "current_text": "same text"}],
-        "test": [{"group_id": "g2", "current_text": "same text"}],
+        "train": [{"group_id": "g1", "current_text": "this is the same text"}],
+        "test": [{"group_id": "g2", "current_text": "this is the same text"}],
     }
     report = leakage_report(splits, secondary_leak_fields=("current_text",))
     assert report["current_text_split_leak_count"] == 1
     assert report["group_split_leak_count"] == 0  # groups are genuinely distinct
+
+
+def test_secondary_field_leaks_min_tokens_floor_ignores_short_reuse() -> None:
+    """A bare one-word confirmation ("yes") legitimately recurs across
+    splits under distinct multiturn contexts; the default 3-token floor
+    must not flag it."""
+    splits = {
+        "train": [{"group_id": "a", "current_text": "yes"}],
+        "test": [{"group_id": "b", "current_text": "yes"}],
+    }
+    assert secondary_field_leaks(splits, "current_text") == {}
+    assert secondary_field_leaks(splits, "current_text", min_tokens=1) != {}
+
+
+def test_secondary_field_leaks_min_tokens_is_configurable() -> None:
+    splits = {
+        "train": [{"group_id": "a", "current_text": "explain that policy again"}],
+        "test": [{"group_id": "b", "current_text": "explain that policy again"}],
+    }
+    assert secondary_field_leaks(splits, "current_text", min_tokens=10) == {}
+    assert secondary_field_leaks(splits, "current_text", min_tokens=3) != {}
+
+
+def test_secondary_field_leaks_row_predicate_scopes_which_rows_count() -> None:
+    splits = {
+        "train": [
+            {"group_id": "a", "current_text": "explain that policy again", "example_kind": "k1"}
+        ],
+        "test": [
+            {"group_id": "b", "current_text": "explain that policy again", "example_kind": "k2"}
+        ],
+    }
+    only_k1 = secondary_field_leaks(
+        splits, "current_text", row_predicate=lambda row: row["example_kind"] == "k1"
+    )
+    assert only_k1 == {}  # the test-split row is filtered out, so no cross-split pair remains
+
+    both = secondary_field_leaks(
+        splits, "current_text", row_predicate=lambda row: True
+    )
+    assert both != {}

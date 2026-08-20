@@ -136,6 +136,47 @@ def test_write_dataset_expected_contract_none_opts_out(tmp_path: Path) -> None:
     assert manifest["contract"] == "dataforge-dataset-manifest"
 
 
+def test_write_dataset_rejects_matching_contract_missing_fingerprint(tmp_path: Path) -> None:
+    """N6: a report whose contract matches but which is missing
+    splits_fingerprint entirely must be refused, not silently treated as
+    unverifiable-but-fine -- build_report always sets one, so its absence
+    on an otherwise-conforming report is itself suspicious."""
+    splits = {"train": [{"text": "a", "group_id": "g1"}], "validation": [], "test": []}
+    report = _clean_report(splits)
+    del report["splits_fingerprint"]
+    with pytest.raises(ValueError, match="splits_fingerprint"):
+        write_dataset(
+            tmp_path,
+            splits,
+            manifest_extra={},
+            report=report,
+            created_at="2024-01-01T00:00:00+00:00",
+            data_card_lines=["# x"],
+        )
+    assert not (tmp_path / "train.jsonl").exists()
+
+
+def test_write_dataset_expected_contract_none_still_checks_present_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """Opting out of the contract check (expected_contract=None) doesn't
+    disable the fingerprint check when a fingerprint IS present -- only its
+    presence stops being mandatory."""
+    splits = {"train": [{"text": "a", "group_id": "g1"}], "validation": [], "test": []}
+    report = _clean_report(splits)
+    splits["train"][0]["text"] = "mutated after the report was computed"
+    with pytest.raises(ValueError, match="stale"):
+        write_dataset(
+            tmp_path,
+            splits,
+            manifest_extra={},
+            report=report,
+            created_at="2024-01-01T00:00:00+00:00",
+            data_card_lines=["# x"],
+            expected_contract=None,
+        )
+
+
 def test_write_dataset_rejects_stale_report_fingerprint(tmp_path: Path) -> None:
     splits = {"train": [{"text": "a", "group_id": "g1"}], "validation": [], "test": []}
     report = _clean_report(splits)
