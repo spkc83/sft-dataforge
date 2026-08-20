@@ -90,6 +90,28 @@ def heldout_leaks(
     return exact, long_ngram
 
 
+def secondary_field_leaks(
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    field: str,
+) -> dict[str, list[str]]:
+    """Cross-split leaks of ``field``'s normalized value, independent of
+    ``group_id``.
+
+    This is what catches a state-conditioned or paraphrased utterance that
+    reuses the same underlying text (e.g. the same ``current_text``) across
+    splits under deliberately distinct group ids -- the identifier-based
+    checks above never see it because the ids genuinely differ.
+    """
+    values: dict[str, set[str]] = {}
+    for split, rows in splits.items():
+        for row in rows:
+            value = row.get(field)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            values.setdefault(normalize_text(value), set()).add(split)
+    return {key: sorted(vals) for key, vals in values.items() if len(vals) > 1}
+
+
 def leakage_report(
     splits: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
@@ -100,6 +122,7 @@ def leakage_report(
     held_out_texts: Iterable[str] = (),
     ngram_size: int = 4,
     heldout_excluded_splits: Sequence[str] = ("test",),
+    secondary_leak_fields: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Report identifiers and held-out text that appear in more than one split."""
     groups: dict[str, set[str]] = {}
@@ -128,7 +151,7 @@ def leakage_report(
         ngram_size=ngram_size,
         excluded_splits=heldout_excluded_splits,
     )
-    return {
+    report: dict[str, Any] = {
         "group_split_leaks": group_leaks,
         "group_split_leak_count": len(group_leaks),
         "trajectory_split_leaks": trajectory_leaks,
@@ -138,3 +161,8 @@ def leakage_report(
         "heldout_exact_leaks": exact_leaks,
         "heldout_ngram_leaks": ngram_leaks,
     }
+    for field in secondary_leak_fields:
+        leaks = secondary_field_leaks(splits, field)
+        report[f"{field}_split_leaks"] = leaks
+        report[f"{field}_split_leak_count"] = len(leaks)
+    return report
