@@ -11,8 +11,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from dataforge.curricula import compose
+from dataforge.curricula import build_report, compose
 from dataforge.emit import write_dataset, write_source_lock
+from dataforge.rows import validate_row_consistency
 from dataforge.teacher import export_teacher_requests, import_teacher_responses
 from examples.banking.curricula import HELD_OUT_TEXTS, REGISTRY
 from examples.banking.taxonomy import (
@@ -28,6 +29,14 @@ TEACHER_MODEL = "stub-teacher-v1"
 TEACHER_PROMPT_HASH = "sha256:stub-prompt"
 EDITABLE_FIELDS = ("assistant_response",)
 
+# Shared between compose() and the post-teacher build_report() re-run, so the
+# report gating the release is computed the same way the pre-teacher report
+# was -- just over the rows actually being emitted.
+REPORT_KWARGS: dict = {
+    "held_out_texts": HELD_OUT_TEXTS,
+    "heldout_excluded_splits": ("test",),
+}
+
 
 def _stub_teacher_rewrite(text: str) -> str:
     """A deterministic stand-in for an LLM teacher: wording only, no facts added."""
@@ -38,8 +47,7 @@ def build(output_dir: Path) -> dict:
     splits, report = compose(
         seed_splits={"train": [], "validation": [], "test": []},
         registry=REGISTRY,
-        held_out_texts=HELD_OUT_TEXTS,
-        heldout_excluded_splits=("test",),
+        **REPORT_KWARGS,
     )
 
     for rows in splits.values():
@@ -60,12 +68,28 @@ def build(output_dir: Path) -> dict:
         editable_fields=EDITABLE_FIELDS,
         teacher_model=TEACHER_MODEL,
         teacher_prompt_hash=TEACHER_PROMPT_HASH,
+        # assistant_response doesn't feed any derived field here, but wiring
+        # a structural validator is cheap and catches drift if that ever
+        # changes (hello-SLM's validate_records analogue).
+        validate=validate_row_consistency,
     )
     realized_by_id = {row["record_id"]: row for row in realized}
     for rows in splits.values():
         for index, row in enumerate(rows):
             if row["record_id"] in realized_by_id:
                 rows[index] = realized_by_id[row["record_id"]]
+
+    # The teacher pass above can change any editable field's content (here,
+    # assistant_response wording) -- and, more generally, could introduce
+    # PII or a held-out leak into a field the original (pre-teacher) report
+    # never scanned as changed. Gating write_dataset on the STALE report
+    # would describe bytes that are no longer what's being emitted; rebuild
+    # it on the realized splits before writing anything.
+    report = build_report(
+        splits,
+        cross_split_duplicates_removed=report["cross_split_duplicates_removed"],
+        **REPORT_KWARGS,
+    )
 
     manifest = write_dataset(
         output_dir,
