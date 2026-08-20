@@ -8,11 +8,19 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from dataforge.curricula import REPORT_CONTRACT, splits_fingerprint
+from dataforge.rows import canonical_json_bytes
 
-def canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
-        "utf-8"
-    )
+__all__ = [
+    "canonical_json_bytes",
+    "default_gates",
+    "file_sha256",
+    "rows_jsonl_bytes",
+    "rows_sha256",
+    "verify_release_split_digests",
+    "write_dataset",
+    "write_source_lock",
+]
 
 
 def rows_jsonl_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:
@@ -61,15 +69,38 @@ def write_dataset(
     split_order: Sequence[str] = ("train", "validation", "test"),
     gates: Sequence[Callable[[Mapping[str, Any]], None]] = (default_gates,),
     allowed_use: Mapping[str, list[str]] | None = None,
+    expected_contract: str | None = REPORT_CONTRACT,
+    row_format_version: int = 1,
 ) -> dict[str, Any]:
     """Write ``{split}.jsonl`` + ``manifest.json`` + ``README.md`` for a dataset.
 
-    Runs every ``gates`` callable against ``report`` before writing anything;
-    a gate raises to abort the release. ``created_at`` is required rather
-    than defaulted to "now" so that callers control (and can make
-    deterministic) the one field in the manifest that would otherwise vary
-    run to run.
+    Before writing anything: if ``expected_contract`` is set (the default is
+    :data:`dataforge.curricula.REPORT_CONTRACT`), ``report["contract"]`` must
+    match it, so an unrecognized/malformed report can never gate a release
+    vacuously. Then, if ``report`` carries a ``splits_fingerprint`` (as
+    :func:`dataforge.curricula.build_report` always produces), it must match
+    a fresh fingerprint recomputed over the exact ``splits`` being written --
+    this is what makes gating on a stale report (e.g. one built before a
+    later teacher-realization pass edited row content) a hard error rather
+    than a silent bypass. Finally every ``gates`` callable runs against
+    ``report``; a gate raises to abort the release.
+
+    ``created_at`` is required rather than defaulted to "now" so that
+    callers control (and can make deterministic) the one field in the
+    manifest that would otherwise vary run to run.
     """
+    if expected_contract is not None and report.get("contract") != expected_contract:
+        raise ValueError(
+            f"report contract {report.get('contract')!r} does not match "
+            f"expected {expected_contract!r}"
+        )
+    expected_fingerprint = report.get("splits_fingerprint")
+    if expected_fingerprint is not None and splits_fingerprint(splits) != expected_fingerprint:
+        raise ValueError(
+            "report is stale: its splits_fingerprint does not match the splits being "
+            "written. Rebuild the report (e.g. dataforge.curricula.build_report) on the "
+            "exact rows you are about to emit, including any post-teacher-realization edits."
+        )
     for gate in gates:
         gate(report)
 
@@ -92,6 +123,7 @@ def write_dataset(
 
     manifest = {
         "contract": "dataforge-dataset-manifest",
+        "row_format_version": row_format_version,
         "created_at": created_at,
         "splits": split_entries,
         "report": report,
@@ -125,12 +157,29 @@ def write_source_lock(
 def verify_release_split_digests(
     split_entries: Sequence[Mapping[str, Any]],
     release_lock: Mapping[str, Any],
+    *,
+    split_order: Sequence[str] | None = None,
 ) -> None:
+    """Verify every split's digest against a release lock.
+
+    Iterates the canonical split list -- ``split_order`` if given, otherwise
+    the names in ``split_entries`` -- rather than ``release_lock``'s own
+    keys, so a lock that is silently missing a split's digest (or carries an
+    empty ``prepared_split_sha256``) is rejected instead of vacuously
+    "verifying" nothing for that split.
+    """
     expected = release_lock.get("prepared_split_sha256")
-    if not isinstance(expected, Mapping):
-        raise ValueError("release lock is missing prepared_split_sha256")
+    if not isinstance(expected, Mapping) or not expected:
+        raise ValueError("release lock is missing a non-empty prepared_split_sha256")
     actual = {str(entry["name"]): str(entry["sha256"]) for entry in split_entries}
-    for split, expected_digest in expected.items():
+    canonical_splits = (
+        tuple(split_order) if split_order is not None else tuple(actual.keys())
+    )
+    missing = [split for split in canonical_splits if split not in expected]
+    if missing:
+        raise ValueError(f"release lock is missing digests for splits: {missing}")
+    for split in canonical_splits:
+        expected_digest = expected[split]
         if actual.get(split) != expected_digest:
             raise ValueError(
                 f"{split} split digest drift: expected {expected_digest}, got {actual.get(split)}"
