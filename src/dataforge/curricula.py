@@ -2,15 +2,33 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from dataforge.guards import count_pii_matches, leakage_report
-from dataforge.rows import normalize_text
+from dataforge.rows import canonical_json_bytes, normalize_text
 
 CurriculumFunc = Callable[[str], Sequence[dict[str, Any]]]
+
+#: Default split iteration/emission order. Purely about ordering -- it does
+#: NOT determine which split wins deduplication; see DEFAULT_DEDUP_PRIORITY.
+DEFAULT_SPLIT_ORDER: tuple[str, ...] = ("train", "validation", "test")
+
+#: Default cross-split dedup priority: eval splits win over train. This is a
+#: fixed constant, deliberately NOT derived from split_order, so reordering
+#: split_order (a cosmetic/emission-order knob) can never silently flip which
+#: split keeps a duplicated example.
+DEFAULT_DEDUP_PRIORITY: tuple[str, ...] = ("test", "validation", "train")
+
+#: The report contract produced by build_report()/compose(). write_dataset()
+#: requires a matching contract by default so it never gates release on a
+#: report it can't interpret.
+REPORT_CONTRACT = "dataforge-curriculum-report"
+
+LeakCheck = Callable[[Mapping[str, Sequence[Mapping[str, Any]]]], Mapping[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -61,6 +79,20 @@ def default_registry() -> Registry:
     return _DEFAULT_REGISTRY
 
 
+def splits_fingerprint(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> str:
+    """A content fingerprint over every field of every row in ``splits``.
+
+    :func:`build_report` records this as ``report["splits_fingerprint"]``,
+    and :func:`dataforge.emit.write_dataset` recomputes it over the exact
+    ``splits`` it is about to write and refuses to gate/emit on a mismatch.
+    This is what makes a stale report (e.g. one built before a teacher
+    realization pass edited row content) a hard error instead of a silent
+    gate bypass -- the report must describe the bytes actually emitted.
+    """
+    payload = {split: list(rows) for split, rows in splits.items()}
+    return f"sha256:{hashlib.sha256(canonical_json_bytes(payload)).hexdigest()}"
+
+
 def _dedup_across_splits(
     splits: Mapping[str, list[dict[str, Any]]],
     priority: Sequence[str],
@@ -84,11 +116,115 @@ def _dedup_across_splits(
     return kept, removed
 
 
+def build_report(
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    text_field: str = "text",
+    group_field: str = "group_id",
+    trajectory_field: str = "trajectory_id",
+    pair_field: str | None = "pair_id",
+    count_fields: Sequence[str] = ("example_kind",),
+    held_out_texts: Iterable[str] = (),
+    ngram_size: int = 4,
+    heldout_excluded_splits: Sequence[str] = ("test",),
+    secondary_leak_fields: Sequence[str] = ("current_text",),
+    extra_leak_checks: Sequence[LeakCheck] = (),
+    pii_fields: Sequence[str] | None = None,
+    cross_split_duplicates_removed: int = 0,
+) -> dict[str, Any]:
+    """Build the governance report for ``splits`` as they stand right now.
+
+    This is what :func:`compose` calls internally after curricula + dedup,
+    but it is also meant to be called again -- on the same config -- by any
+    caller that mutates row content after ``compose`` (most commonly, a
+    teacher-realization pass rewriting wording fields). The manifest's
+    governance report must describe the bytes actually emitted, so gating on
+    a report computed before such a mutation is a bug: rebuild the report
+    on the post-mutation ``splits`` before calling
+    :func:`dataforge.emit.write_dataset`.
+
+    ``pii_fields``: ``None`` (the default) scans every string-valued field
+    of every row for PII, not just ``text_field`` -- a teacher editing e.g.
+    an ``assistant_response`` field can introduce PII just as easily as a
+    curriculum editing ``text``. Pass an explicit field list to scan only
+    those fields.
+
+    ``secondary_leak_fields``: in addition to identifier-based leakage
+    (group/trajectory/pair), also flag any of these fields whose normalized
+    value appears in more than one split -- even under different
+    ``group_id``s. Defaults to ``("current_text",)``, restoring hello-SLM's
+    state-conditioned-utterance leak coverage generically (no hardcoded
+    example-kind names or group-id prefixes required).
+
+    ``extra_leak_checks``: additional callables, each given ``splits`` and
+    returning a dict merged into ``report["leakage"]``. Lets a domain team
+    add its own leak checks (e.g. a paraphrase-family check) without
+    mutating this module or the returned report's other keys; any key
+    ending in ``_leak_count``/``_leaks`` gates automatically via
+    :func:`dataforge.emit.default_gates`. Raises if a check's keys collide
+    with the built-in leakage keys or with another check's keys.
+    """
+    counts = {
+        field: {
+            split: dict(Counter(str(row.get(field)) for row in rows))
+            for split, rows in splits.items()
+        }
+        for field in count_fields
+    }
+
+    leakage = dict(
+        leakage_report(
+            splits,
+            group_field=group_field,
+            trajectory_field=trajectory_field,
+            pair_field=pair_field,
+            text_field=text_field,
+            held_out_texts=held_out_texts,
+            ngram_size=ngram_size,
+            heldout_excluded_splits=heldout_excluded_splits,
+            secondary_leak_fields=secondary_leak_fields,
+        )
+    )
+    for check in extra_leak_checks:
+        result = check(splits)
+        overlap = set(result) & set(leakage)
+        if overlap:
+            raise ValueError(f"extra_leak_checks produced colliding report keys: {sorted(overlap)}")
+        leakage.update(result)
+
+    if pii_fields is None:
+        pii_texts: Iterable[str] = (
+            value
+            for rows in splits.values()
+            for row in rows
+            for value in row.values()
+            if isinstance(value, str)
+        )
+    else:
+        pii_texts = (
+            str(row[field])
+            for rows in splits.values()
+            for row in rows
+            for field in pii_fields
+            if field in row and isinstance(row[field], str)
+        )
+
+    return {
+        "contract": REPORT_CONTRACT,
+        "splits_fingerprint": splits_fingerprint(splits),
+        "split_counts": {split: len(rows) for split, rows in splits.items()},
+        "counts": counts,
+        "cross_split_duplicates_removed": cross_split_duplicates_removed,
+        "pii_matches": count_pii_matches(pii_texts),
+        "leakage": leakage,
+    }
+
+
 def compose(
     seed_splits: Mapping[str, Sequence[Mapping[str, Any]]],
     registry: Registry,
     *,
-    split_order: Sequence[str] = ("train", "validation", "test"),
+    split_order: Sequence[str] = DEFAULT_SPLIT_ORDER,
     dedup_priority: Sequence[str] | None = None,
     text_field: str = "text",
     group_field: str = "group_id",
@@ -98,19 +234,47 @@ def compose(
     held_out_texts: Iterable[str] = (),
     ngram_size: int = 4,
     heldout_excluded_splits: Sequence[str] = ("test",),
+    secondary_leak_fields: Sequence[str] = ("current_text",),
+    extra_leak_checks: Sequence[LeakCheck] = (),
+    pii_fields: Sequence[str] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     """Run every registered curriculum, enforce non-leakage, dedup, and report.
+
+    Every key in ``seed_splits`` and every split any registered curriculum
+    targets must be in ``split_order``; anything else raises immediately
+    rather than being silently dropped.
 
     Rows are accumulated split by split (seed rows, then curriculum rows).
     Any ``group_id``/``trajectory_id``/``pair_id`` seen under more than one
     split raises immediately (fail-fast, matching the order examples were
     produced in). The accumulated rows are then deduplicated by normalized
-    text across splits: ``dedup_priority`` (default: eval splits before
-    train, i.e. ``reversed(split_order)``) decides which split keeps a row
-    when the same text appears in more than one. Finally a governance report
-    (per-field counts, cross-split duplicate count, PII matches, and a full
-    leakage report) is produced over the deduplicated result.
+    text across splits: ``dedup_priority`` decides which split keeps a row
+    when the same text appears in more than one, and defaults to
+    :data:`DEFAULT_DEDUP_PRIORITY` (eval splits before train) -- a fixed
+    constant, independent of ``split_order``'s permutation, so reordering
+    ``split_order`` can never silently change which split wins. When
+    ``split_order`` uses non-default split names, pass ``dedup_priority``
+    explicitly; otherwise ``compose`` raises rather than guess.
+
+    Finally, :func:`build_report` produces the governance report over the
+    deduplicated result.
     """
+    split_order = tuple(split_order)
+
+    unknown_seed_splits = set(seed_splits) - set(split_order)
+    if unknown_seed_splits:
+        raise ValueError(
+            f"seed_splits has splits not in split_order: {sorted(unknown_seed_splits)}"
+        )
+    unknown_curriculum_splits = {
+        split for registered in registry.curricula for split in registered.splits
+    } - set(split_order)
+    if unknown_curriculum_splits:
+        raise ValueError(
+            "registered curricula target splits not in split_order: "
+            f"{sorted(unknown_curriculum_splits)}"
+        )
+
     splits: dict[str, list[dict[str, Any]]] = {
         split: [dict(row) for row in seed_splits.get(split, ())] for split in split_order
     }
@@ -145,33 +309,28 @@ def compose(
             _track(row, split)
             splits[split].append(row)
 
-    priority = tuple(dedup_priority) if dedup_priority is not None else tuple(reversed(split_order))
+    priority = tuple(dedup_priority) if dedup_priority is not None else DEFAULT_DEDUP_PRIORITY
+    if set(priority) != set(split_order):
+        raise ValueError(
+            "dedup_priority must be a permutation of split_order; got "
+            f"dedup_priority={priority!r} for split_order={split_order!r}. Pass "
+            "dedup_priority explicitly when using non-default split names."
+        )
     deduplicated, duplicates_removed = _dedup_across_splits(splits, priority, text_field)
 
-    counts = {
-        field: {
-            split: dict(Counter(str(row.get(field)) for row in rows))
-            for split, rows in deduplicated.items()
-        }
-        for field in count_fields
-    }
-    report = {
-        "contract": "dataforge-curriculum-report",
-        "split_counts": {split: len(rows) for split, rows in deduplicated.items()},
-        "counts": counts,
-        "cross_split_duplicates_removed": duplicates_removed,
-        "pii_matches": count_pii_matches(
-            str(row[text_field]) for rows in deduplicated.values() for row in rows
-        ),
-        "leakage": leakage_report(
-            deduplicated,
-            group_field=group_field,
-            trajectory_field=trajectory_field,
-            pair_field=pair_field,
-            text_field=text_field,
-            held_out_texts=held_out_texts,
-            ngram_size=ngram_size,
-            heldout_excluded_splits=heldout_excluded_splits,
-        ),
-    }
+    report = build_report(
+        deduplicated,
+        text_field=text_field,
+        group_field=group_field,
+        trajectory_field=trajectory_field,
+        pair_field=pair_field,
+        count_fields=count_fields,
+        held_out_texts=held_out_texts,
+        ngram_size=ngram_size,
+        heldout_excluded_splits=heldout_excluded_splits,
+        secondary_leak_fields=secondary_leak_fields,
+        extra_leak_checks=extra_leak_checks,
+        pii_fields=pii_fields,
+        cross_split_duplicates_removed=duplicates_removed,
+    )
     return deduplicated, report
