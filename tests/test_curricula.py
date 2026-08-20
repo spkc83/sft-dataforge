@@ -264,6 +264,32 @@ def test_pii_fields_explicit_list_restricts_scan() -> None:
     assert report["pii_matches"] == 0
 
 
+def test_pii_scan_recurses_into_nested_dict_fields() -> None:
+    """N4: PII living only inside a nested dict field (e.g. prior_state or
+    provenance), never in a top-level string field, must still be caught."""
+    row = _row("clean text with no pii", "g1")
+    row["prior_state"] = {"caller_phone": "555-867-5309", "email": "a.customer@examplebank.com"}
+    row["provenance"] = {"analyst_note": "SSN 123-45-6789 on file"}
+    report = build_report({"train": [row], "validation": [], "test": []})
+    assert report["pii_matches"] > 0
+
+
+def test_pii_scan_recurses_into_nested_list_fields() -> None:
+    row = _row("clean text with no pii", "g1")
+    row["history"] = [{"role": "user", "content": "my ssn is 123-45-6789"}]
+    report = build_report({"train": [row], "validation": [], "test": []})
+    assert report["pii_matches"] > 0
+
+
+def test_pii_fields_explicit_list_still_recurses_within_each_field() -> None:
+    row = _row("clean text with no pii", "g1")
+    row["provenance"] = {"analyst_note": "contact fraud@examplebank.com"}
+    report = build_report(
+        {"train": [row], "validation": [], "test": []}, pii_fields=("provenance",)
+    )
+    assert report["pii_matches"] > 0
+
+
 def test_seed_split_outside_split_order_raises() -> None:
     registry = Registry()
     seed = {

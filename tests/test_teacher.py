@@ -232,6 +232,83 @@ def test_import_rejects_response_that_smuggles_inconsistent_text(tmp_path: Path)
         )
 
 
+def test_editable_derived_field_itself_without_rederive_is_refused(tmp_path: Path) -> None:
+    """N1: the guard must fire when the DERIVED field itself (`text`) is
+    made directly editable, not only when one of its dependencies is --
+    otherwise a teacher rewriting `text` directly leaves `current_text`
+    stale with no error, mirroring the original defect-2 hole exactly."""
+    row = {**_routed_row("what is the overdraft policy"), "record_id": "g1"}
+    with pytest.raises(TeacherRealizationError, match="derived field"):
+        export_teacher_requests([row], tmp_path / "req.jsonl", editable_fields=["text"])
+
+
+def test_noop_rederive_is_caught_by_the_now_mandatory_validate(tmp_path: Path) -> None:
+    """N2: a `rederive` that satisfies the wiring guard but doesn't actually
+    resync anything (a no-op stub, or a bug) must not silently pass --
+    `validate` defaults to `validate_row_consistency` whenever a derived
+    field is affected, so the staleness a no-op rederive leaves behind is
+    caught at runtime instead of accepted."""
+    row = {**_routed_row("what is the overdraft policy"), "record_id": "g1"}
+    noop = lambda record: None  # noqa: E731
+    editable = ["current_text"]
+    requests_path = tmp_path / "req.jsonl"
+    export_teacher_requests([row], requests_path, editable_fields=editable, rederive=noop)
+    request = json.loads(requests_path.read_text().splitlines()[0])
+
+    responses_path = tmp_path / "resp.jsonl"
+    responses_path.write_text(
+        json.dumps(
+            {
+                "record_id": "g1",
+                "immutable_hash": request["immutable_hash"],
+                "fields": {"current_text": "MY SSN IS 123-45-6789 tell me the overdraft policy"},
+            }
+        )
+        + "\n"
+    )
+    with pytest.raises(TeacherRealizationError, match="inconsistent"):
+        import_teacher_responses(
+            [row],
+            responses_path,
+            editable_fields=editable,
+            teacher_model="m",
+            teacher_prompt_hash="h",
+            rederive=noop,
+        )
+
+
+def test_affected_derived_field_requires_validate_even_if_explicitly_none(tmp_path: Path) -> None:
+    """The mandatory-validate requirement cannot be defeated by explicitly
+    passing validate=None either -- only derived_fields={} (a full, explicit
+    opt-out of the guard) may skip it."""
+    row = {**_routed_row("what is the overdraft policy"), "record_id": "g1"}
+    with pytest.raises(TeacherRealizationError, match="validate"):
+        export_teacher_requests(
+            [row],
+            tmp_path / "req.jsonl",
+            editable_fields=["current_text"],
+            rederive=rederive_text,
+            validate=None,
+        )
+
+
+def test_rederive_for_an_unaffected_field_does_not_widen_hash_exclusion(tmp_path: Path) -> None:
+    """N3: passing `rederive` defensively for an editable field that isn't
+    actually a dependency of any derived field must not exclude unrelated
+    derived fields (e.g. `text`) from the immutable hash -- only fields
+    `rederive` is actually responsible for are ever excluded."""
+    row = {**_routed_row("what is the overdraft policy"), "record_id": "g1"}
+    without_path = tmp_path / "without.jsonl"
+    with_path = tmp_path / "with.jsonl"
+    export_teacher_requests([row], without_path, editable_fields=["assistant_response"])
+    export_teacher_requests(
+        [row], with_path, editable_fields=["assistant_response"], rederive=rederive_text
+    )
+    without_hash = json.loads(without_path.read_text().splitlines()[0])["immutable_hash"]
+    with_hash = json.loads(with_path.read_text().splitlines()[0])["immutable_hash"]
+    assert without_hash == with_hash
+
+
 def test_import_rejects_missing_field(tmp_path: Path) -> None:
     records = [_record()]
     responses_path = tmp_path / "responses.jsonl"
