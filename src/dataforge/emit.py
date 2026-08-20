@@ -77,23 +77,37 @@ def write_dataset(
     Before writing anything: if ``expected_contract`` is set (the default is
     :data:`dataforge.curricula.REPORT_CONTRACT`), ``report["contract"]`` must
     match it, so an unrecognized/malformed report can never gate a release
-    vacuously. Then, if ``report`` carries a ``splits_fingerprint`` (as
-    :func:`dataforge.curricula.build_report` always produces), it must match
-    a fresh fingerprint recomputed over the exact ``splits`` being written --
-    this is what makes gating on a stale report (e.g. one built before a
-    later teacher-realization pass edited row content) a hard error rather
-    than a silent bypass. Finally every ``gates`` callable runs against
+    vacuously. Whenever that contract check applies and passes, ``report``
+    must also carry a ``splits_fingerprint`` -- :func:`dataforge.curricula.build_report`
+    always sets one, so its *absence* on an otherwise-conforming report is
+    itself treated as an error rather than silently skipping the check (a
+    report shaped like a fresh one but missing just that one key must not be
+    trusted as fresh). The fingerprint must match one freshly recomputed
+    over the exact ``splits`` being written -- this is what makes gating on
+    a stale report (e.g. one built before a later teacher-realization pass
+    edited row content) a hard error rather than a silent bypass. With
+    ``expected_contract=None`` (a deliberate opt-out for a bespoke report
+    shape), a present ``splits_fingerprint`` is still verified but is no
+    longer required. Finally every ``gates`` callable runs against
     ``report``; a gate raises to abort the release.
 
     ``created_at`` is required rather than defaulted to "now" so that
     callers control (and can make deterministic) the one field in the
     manifest that would otherwise vary run to run.
     """
-    if expected_contract is not None and report.get("contract") != expected_contract:
-        raise ValueError(
-            f"report contract {report.get('contract')!r} does not match "
-            f"expected {expected_contract!r}"
-        )
+    if expected_contract is not None:
+        if report.get("contract") != expected_contract:
+            raise ValueError(
+                f"report contract {report.get('contract')!r} does not match "
+                f"expected {expected_contract!r}"
+            )
+        if "splits_fingerprint" not in report:
+            raise ValueError(
+                "report contract matches but splits_fingerprint is missing -- "
+                "dataforge.curricula.build_report always sets one, so its absence means this "
+                "report cannot be trusted as fresh. Rebuild it with build_report(), or pass "
+                "expected_contract=None if this report is deliberately not build_report-shaped."
+            )
     expected_fingerprint = report.get("splits_fingerprint")
     if expected_fingerprint is not None and splits_fingerprint(splits) != expected_fingerprint:
         raise ValueError(
