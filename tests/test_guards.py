@@ -369,6 +369,40 @@ def test_paired_counterfactual_exemption_rejects_identical_targets_within_a_pair
     assert exempt(bucket) is False
 
 
+def test_paired_counterfactual_exemption_rejects_a_pair_with_a_missing_target() -> None:
+    """A row with no `pair_target` (or a None/blank one) proves nothing about
+    how the shared utterance resolves, so it must disqualify the bucket --
+    NOT count as a second "distinct" target against its partner's real value.
+    """
+    exempt = paired_counterfactual_exemption()
+    partner = _pair_row("g1", "p1", "list_cards", ["a"], "train")
+    for missing in ({}, {"pair_target": None}, {"pair_target": ""}):
+        row = _pair_row("g2", "p1", "unused", ["b"], "train")
+        del row["pair_target"]
+        row.update(missing)
+        assert exempt([partner, row]) is False
+
+
+def test_duplicate_text_leaks_reports_a_bucket_whose_pair_has_a_missing_target() -> None:
+    splits = {
+        "train": [
+            _pair_row("g1", "p1", "list_cards", ["a"], "unused"),
+            _pair_row("g2", "p1", "unused", ["b"], "unused"),
+        ],
+    }
+    for row in splits["train"]:
+        del row["_split"]
+    del splits["train"][1]["pair_target"]
+    result = duplicate_text_leaks(
+        splits, "user_text", exempt=paired_counterfactual_exemption()
+    )
+    assert result["user_text_duplicate_leak_count"] == 1
+    assert result["user_text_duplicate_leaks"][0]["members"] == [
+        {"split": "train", "group_id": "g1"},
+        {"split": "train", "group_id": "g2"},
+    ]
+
+
 def test_paired_counterfactual_exemption_rejects_a_bucket_spanning_two_splits() -> None:
     """A counterfactual pair is a within-split construction; the same text in
     two splits is leakage, never an exemptible pair."""
