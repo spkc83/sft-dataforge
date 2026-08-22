@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from typing import Any
 
@@ -36,6 +37,22 @@ def normalize_text(text: str) -> str:
     return " ".join(
         "".join(character.lower() if character.isalnum() else " " for character in text).split()
     )
+
+
+def normalize_text_ascii(text: str) -> str:
+    """Lowercase, then map every run of non-``[a-z0-9]`` characters to a single
+    space, and strip.
+
+    Deliberately **not** the same predicate as :func:`normalize_text`: that one
+    uses Unicode-aware ``str.isalnum()``, so ``"Café"`` normalizes to ``"café"``,
+    while this one treats any non-ASCII character as punctuation and yields
+    ``"caf"``. This is the exact predicate the v9 uniqueness checks used, so
+    duplicate detection ported from there keeps its measured behaviour; it is
+    the default ``normalize`` for
+    :func:`dataforge.guards.duplicate_text_leaks`. Use :func:`normalize_text`
+    for anything that should respect non-ASCII alphabets.
+    """
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
 def render_context(

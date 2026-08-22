@@ -111,27 +111,67 @@ def splits_fingerprint(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> str
     return f"sha256:{hashlib.sha256(canonical_json_bytes(payload)).hexdigest()}"
 
 
+def _merge_leakage(
+    leakage: dict[str, Any], result: Mapping[str, Any], *, source: str
+) -> dict[str, Any]:
+    """Merge one leak check's result into ``leakage``, refusing collisions.
+
+    Shared by ``build_report``'s ``extra_leak_checks`` and ``compose``'s
+    ``pre_dedup_checks`` so both obey one rule: a check may never overwrite a
+    built-in leakage key or another check's key -- silently shadowing a
+    ``*_leaks``/``*_leak_count`` key would disarm the gate that reads it.
+    """
+    overlap = set(result) & set(leakage)
+    if overlap:
+        raise ValueError(f"{source} produced colliding report keys: {sorted(overlap)}")
+    leakage.update(result)
+    return leakage
+
+
+def _failing_leak_keys(leakage: Mapping[str, Any]) -> list[str]:
+    """Keys that :func:`dataforge.emit.default_gates` would fail the build on."""
+    return sorted(
+        key
+        for key, value in leakage.items()
+        if (key.endswith("_leak_count") or key.endswith("_leaks")) and value
+    )
+
+
 def _dedup_across_splits(
     splits: Mapping[str, list[dict[str, Any]]],
     priority: Sequence[str],
     text_field: str,
-) -> tuple[dict[str, list[dict[str, Any]]], int]:
+) -> tuple[dict[str, list[dict[str, Any]]], int, int]:
+    """Drop duplicate ``text_field`` values, ``priority``'s earlier splits winning.
+
+    Returns ``(kept, removed, within_split_removed)``. ``removed`` counts every
+    dropped row, cross-split and within-split alike -- its historical meaning,
+    kept unchanged so no caller's ``cross_split_duplicates_removed`` shifts
+    value. ``within_split_removed`` is a sub-count of it: rows dropped because
+    the same text already appeared **earlier in their own split**. Neither
+    number gates anything; they are report metadata.
+    """
     if set(priority) != set(splits.keys()):
         raise ValueError("dedup_priority must be a permutation of the split names")
     seen: set[str] = set()
     kept: dict[str, list[dict[str, Any]]] = {split: [] for split in splits}
     removed = 0
+    within_split_removed = 0
     for split in priority:
         local: set[str] = set()
         for row in splits[split]:
             key = normalize_text(str(row[text_field]))
-            if key in seen or key in local:
+            if key in seen:
                 removed += 1
+                continue
+            if key in local:
+                removed += 1
+                within_split_removed += 1
                 continue
             kept[split].append(row)
             local.add(key)
         seen.update(local)
-    return kept, removed
+    return kept, removed, within_split_removed
 
 
 def build_report(
@@ -151,6 +191,7 @@ def build_report(
     extra_leak_checks: Sequence[LeakCheck] = (),
     pii_fields: Sequence[str] | None = None,
     cross_split_duplicates_removed: int = 0,
+    within_split_duplicates_removed: int = 0,
 ) -> dict[str, Any]:
     """Build the governance report for ``splits`` as they stand right now.
 
@@ -191,6 +232,11 @@ def build_report(
     ending in ``_leak_count``/``_leaks`` gates automatically via
     :func:`dataforge.emit.default_gates`. Raises if a check's keys collide
     with the built-in leakage keys or with another check's keys.
+
+    ``cross_split_duplicates_removed``/``within_split_duplicates_removed`` are
+    reported verbatim (``build_report`` cannot recompute them -- only
+    :func:`compose` sees the pre-dedup rows). The first counts every row dedup
+    dropped, the second is its within-split sub-count. Neither gates.
     """
     counts = {
         field: {
@@ -216,11 +262,7 @@ def build_report(
         )
     )
     for check in extra_leak_checks:
-        result = check(splits)
-        overlap = set(result) & set(leakage)
-        if overlap:
-            raise ValueError(f"extra_leak_checks produced colliding report keys: {sorted(overlap)}")
-        leakage.update(result)
+        _merge_leakage(leakage, check(splits), source="extra_leak_checks")
 
     if pii_fields is None:
         pii_texts: Iterable[str] = (
@@ -245,6 +287,7 @@ def build_report(
         "split_counts": {split: len(rows) for split, rows in splits.items()},
         "counts": counts,
         "cross_split_duplicates_removed": cross_split_duplicates_removed,
+        "within_split_duplicates_removed": within_split_duplicates_removed,
         "pii_matches": count_pii_matches(pii_texts),
         "leakage": leakage,
     }
@@ -268,6 +311,7 @@ def compose(
     secondary_leak_min_tokens: int = 3,
     secondary_leak_row_predicate: Callable[[Mapping[str, Any]], bool] | None = None,
     extra_leak_checks: Sequence[LeakCheck] = (),
+    pre_dedup_checks: Sequence[LeakCheck] = (),
     pii_fields: Sequence[str] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     """Run every registered curriculum, enforce non-leakage, dedup, and report.
@@ -287,6 +331,19 @@ def compose(
     ``split_order`` can never silently change which split wins. When
     ``split_order`` uses non-default split names, pass ``dedup_priority``
     explicitly; otherwise ``compose`` raises rather than guess.
+
+    ``pre_dedup_checks`` run on the raw accumulated splits -- after the
+    leak-tracking pass, **before** deduplication -- and fail the build fast:
+    if any of their merged keys ending in ``_leak_count`` is truthy or ending
+    in ``_leaks`` is non-empty, ``compose`` raises ``ValueError("pre-dedup
+    check failed: ...")``, exactly as an id collision does. They exist because
+    dedup on ``text_field`` runs before :func:`build_report`, so a report-time
+    check can never observe a within-split ``text`` duplicate -- by then it has
+    already been silently dropped. Failing here (rather than reporting) also
+    means a post-teacher ``build_report`` rebuild needs no re-injection and
+    :func:`dataforge.emit.write_dataset` can never see a build these checks
+    rejected. Their keys are merged into ``report["leakage"]`` for the record,
+    under the same collision rule as ``extra_leak_checks``.
 
     Finally, :func:`build_report` produces the governance report over the
     deduplicated result.
@@ -341,6 +398,16 @@ def compose(
             _track(row, split)
             splits[split].append(row)
 
+    pre_dedup_leakage: dict[str, Any] = {}
+    for check in pre_dedup_checks:
+        _merge_leakage(pre_dedup_leakage, check(splits), source="pre_dedup_checks")
+    failing = _failing_leak_keys(pre_dedup_leakage)
+    if failing:
+        raise ValueError(
+            f"pre-dedup check failed: {failing} -- "
+            + ", ".join(f"{key}={pre_dedup_leakage[key]!r}" for key in failing)
+        )
+
     priority = tuple(dedup_priority) if dedup_priority is not None else DEFAULT_DEDUP_PRIORITY
     if set(priority) != set(split_order):
         raise ValueError(
@@ -348,7 +415,9 @@ def compose(
             f"dedup_priority={priority!r} for split_order={split_order!r}. Pass "
             "dedup_priority explicitly when using non-default split names."
         )
-    deduplicated, duplicates_removed = _dedup_across_splits(splits, priority, text_field)
+    deduplicated, duplicates_removed, within_split_removed = _dedup_across_splits(
+        splits, priority, text_field
+    )
 
     report = build_report(
         deduplicated,
@@ -366,5 +435,7 @@ def compose(
         extra_leak_checks=extra_leak_checks,
         pii_fields=pii_fields,
         cross_split_duplicates_removed=duplicates_removed,
+        within_split_duplicates_removed=within_split_removed,
     )
+    _merge_leakage(report["leakage"], pre_dedup_leakage, source="pre_dedup_checks")
     return deduplicated, report
