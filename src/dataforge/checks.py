@@ -77,6 +77,11 @@ SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 #: "1792 is frozen" opens on ``("is", "frozen")``.
 ALPHA_TOKEN_RE = re.compile(r"[a-z]+")
 
+#: The shape :func:`dataforge.teacher.immutable_hash` emits. A hash that does
+#: not match it is not a hash the importer could ever accept, whatever it
+#: compares equal to.
+SHA256_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
 
 class CheckerInputError(ValueError):
     """Raised when the batch cannot be *read* -- a missing JSONL file or a row
@@ -84,8 +89,10 @@ class CheckerInputError(ValueError):
 
     This is the checker's only exception: every defect in the batch's
     *content* is reported as a :class:`Finding` instead. A malformed JSON line
-    surfaces as the underlying :class:`json.JSONDecodeError` (also a
-    ``ValueError``), which carries the line's own diagnostics.
+    surfaces as the underlying :class:`json.JSONDecodeError`, which carries the
+    offending line and column and is more useful than anything this module
+    could rewrap it in. Both are ``ValueError`` subclasses, so a caller that
+    wants "the batch could not be read" as one case catches ``ValueError``.
     """
 
 
@@ -274,9 +281,10 @@ def check_teacher_batch(
     sorted by ``(record_id, rule, detail)``. An empty list means the batch is
     clean.
 
-    Raises only :class:`CheckerInputError` (and :class:`json.JSONDecodeError`)
-    for unreadable input. Exceptions raised *by a rule* are programming errors
-    in the rule and propagate unchanged.
+    Raises only :class:`CheckerInputError` (and :class:`json.JSONDecodeError`
+    on a malformed line) for unreadable input -- catch ``ValueError`` to cover
+    both. Exceptions raised *by a rule* are programming errors in the rule and
+    propagate unchanged.
     """
     batch, findings = build_batch(requests, responses, records, record_id_field=record_id_field)
     collected = list(findings)
@@ -344,15 +352,38 @@ def _text(row: Mapping[str, Any], field: str) -> str | None:
 
 
 def hash_pinned() -> Rule:
-    """The response must echo the request's ``immutable_hash`` unchanged.
+    """The response must echo the request's ``immutable_hash``, well formed.
 
     This is the checker-side mirror of ``import_teacher_responses``' pre-hash
     check: catching a moved hash here reports every affected row at once,
     where the importer would raise on the first.
+
+    Presence and shape are checked before equality, because a teacher that
+    dropped the field entirely would otherwise compare equal to a request that
+    never carried one -- two absent hashes are not a pinned hash:
+
+    * ``immutable_hash missing on request`` / ``... missing on response`` --
+      absent, not a string, or empty;
+    * ``immutable_hash is not sha256:<64 hex>`` -- present on one or both sides
+      but not in :func:`dataforge.teacher.immutable_hash`'s output format;
+    * ``immutable_hash mismatch`` -- both present and different.
     """
 
     def check(pair: Pair) -> Iterable[str]:
-        if pair.response.get("immutable_hash") != pair.request.get("immutable_hash"):
+        request_hash = pair.request.get("immutable_hash")
+        response_hash = pair.response.get("immutable_hash")
+        if not isinstance(request_hash, str) or not request_hash:
+            yield "immutable_hash missing on request"
+            request_hash = None
+        if not isinstance(response_hash, str) or not response_hash:
+            yield "immutable_hash missing on response"
+            response_hash = None
+        if any(
+            value is not None and not SHA256_HASH_RE.match(value)
+            for value in (request_hash, response_hash)
+        ):
+            yield "immutable_hash is not sha256:<64 hex>"
+        if request_hash is not None and response_hash is not None and request_hash != response_hash:
             yield "immutable_hash mismatch"
 
     return row_rule("hash_pinned", check)
@@ -514,9 +545,16 @@ def unique_normalized(
     is a duplicate the dataset build cannot see because that row's own text
     never changed. Both are reported here (v9 rules j and n):
 
-    * ``duplicates the rewrite of {other}`` -- attributed to **both** rewrites,
-      since neither is more at fault than the other;
-    * ``duplicates untouched record {id}`` -- attributed to the rewriter only.
+    * ``{field} duplicates the rewrite of {first}`` -- among ``k`` colliding
+      rewrites the lowest record id (sorted) is treated as the incumbent and
+      the other ``k - 1`` are flagged against it, as v9 does. That keeps the
+      report at ``k - 1`` actionable lines instead of ``k * (k - 1)`` mutual
+      accusations, and names one row to keep;
+    * ``{field} duplicates untouched record {id}`` -- attributed to every
+      colliding rewrite, since no rewrite may reproduce released text.
+
+    Details carry the field name so two instances of this rule on different
+    fields of the same row stay distinct findings.
 
     Two untouched records that already share text are *not* flagged: they are
     the build's business, not the teacher's, and the dataset guards
@@ -581,16 +619,25 @@ def unique_normalized(
                 continue
             if exempt is not None and exempt([member for _, member in (*owners, *others)]):
                 continue
-            for record_id, _ in owners:
-                details = [
-                    f"duplicates the rewrite of {other_id}"
-                    for other_id, _ in owners
-                    if other_id != record_id
-                ]
-                details += [f"duplicates untouched record {other_id}" for other_id, _ in others]
-                findings.extend(
-                    Finding(record_id, "unique_normalized", detail) for detail in details
+            ranked = sorted(record_id for record_id, _ in owners)
+            incumbent = ranked[0]
+            findings.extend(
+                Finding(
+                    record_id,
+                    "unique_normalized",
+                    f"{field} duplicates the rewrite of {incumbent}",
                 )
+                for record_id in ranked[1:]
+            )
+            findings.extend(
+                Finding(
+                    record_id,
+                    "unique_normalized",
+                    f"{field} duplicates untouched record {other_id}",
+                )
+                for record_id in ranked
+                for other_id, _ in others
+            )
         return findings
 
     return rule
@@ -619,7 +666,10 @@ def opening_ngram_cap(
     tokens of the rewritten field, lowercased)``, and once a key is used more
     than ``max_uses`` times **every** pair using it is flagged -- there is no
     principled way to pick which of five identical openings is the offender,
-    and the fix is to rewrite several of them.
+    and the fix is to rewrite several of them. The detail is
+    ``{field} opening {n}-gram '...' used {count} times in {family}``, named
+    after the field so a second instance of this rule on another field stays a
+    separate finding.
 
     ``family_of`` is required because the cap is only meaningful within a set of
     comparable scenarios: four "I have frozen" openings across four different
@@ -646,7 +696,7 @@ def opening_ngram_cap(
             uses = len(record_ids)
             if uses <= max_uses:
                 continue
-            detail = f"opening {n}-gram {' '.join(gram)!r} used {uses} times in {family}"
+            detail = f"{field} opening {n}-gram {' '.join(gram)!r} used {uses} times in {family}"
             findings.extend(
                 Finding(record_id, "opening_ngram_cap", detail) for record_id in record_ids
             )
