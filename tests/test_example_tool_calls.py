@@ -102,6 +102,12 @@ def test_tool_calls_example_passes_its_release_gates(tmp_path: Path) -> None:
         assert leakage[key] == 0
     assert leakage["banned_wording_leaks"] == []
     assert report["split_counts"] == {"train": 5, "validation": 3, "test": 2}
+    # compose's pre-dedup findings are carried into the emitted report, so the
+    # manifest on disk distinguishes "the gate ran and passed" from "it was
+    # never wired". build_report cannot recompute them: they are about the rows
+    # as they stood before deduplication.
+    assert leakage["user_text_duplicate_leak_count"] == 0
+    assert leakage["user_text_duplicate_leaks"] == []
 
 
 def test_scrubbed_row_carries_a_projection_tagged_pre_scrub_stamp(tmp_path: Path) -> None:
@@ -189,6 +195,29 @@ def test_without_the_scrub_the_banned_wording_gate_fails_the_release(
     monkeypatch.setattr(build_tool_calls, "_scrub_context_wording", lambda splits: None)
     with pytest.raises(ValueError, match="nonempty banned_wording_leaks"):
         build(tmp_path / "run1")
+    assert not (tmp_path / "run1" / "train.jsonl").exists()
+
+
+def test_identical_finals_for_the_governed_pair_are_a_checker_finding(tmp_path: Path) -> None:
+    """The pair exemption covers the shared utterance, never a shared answer.
+
+    Without this, the collision surfaces only as `default_gates` refusing the
+    release with no record id and no rule name -- while the checker, whose job
+    is to hand back actionable per-row findings, reports clean.
+    """
+
+    def colliding_teacher(record_id: str, final_response: str) -> str:
+        if record_id in {"train-pair-execute-0", "train-pair-clarify-0"}:
+            return "I have taken care of that card for you right away."
+        return _stub_teacher_rewrite(record_id, final_response)
+
+    with pytest.raises(ValueError, match="teacher batch check failed") as error:
+        build(tmp_path / "run1", teacher_rewrite=colliding_teacher)
+    message = str(error.value)
+    # Rule name and the field it is about; the detail wording is the checker's.
+    assert "unique_normalized" in message
+    assert "final_response" in message
+    assert "train-pair-clarify-0" in message
     assert not (tmp_path / "run1" / "train.jsonl").exists()
 
 

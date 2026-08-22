@@ -94,12 +94,23 @@ TEACHER_CLOSER = "Let me know if you would like anything else on the account."
 
 Splits = Mapping[str, Sequence[Mapping[str, Any]]]
 
-#: Reused three times -- as the pre-dedup exemption, and inside the checker's
-#: cross-row uniqueness rule -- because "this duplicate is a governed pair" is
-#: one predicate, not one per call site. ``context_fields`` names the
-#: conversation row's context; the default (``history``) is the classifier
-#: row's.
+#: The pre-dedup exemption, and the only duplicate this dataset is allowed to
+#: contain. It is deliberately **not** given to the checker's
+#: ``unique_normalized("final_response", ...)`` rule below: it proves two rows
+#: may share an *utterance*, never that they may share an *answer*, and using it
+#: there would hide from the checker exactly what ``default_gates`` refuses at
+#: emission -- leaving a duplicate final to surface as an unattributed release
+#: failure instead of a per-row finding to send back to the teacher.
+#: ``context_fields`` names the conversation row's context; the default
+#: (``history``) is the classifier row's.
 GOVERNED_PAIR_EXEMPTION = paired_counterfactual_exemption(context_fields=("context_messages",))
+
+#: The keys ``_duplicate_user_text_check`` contributes to ``compose``'s report.
+#: Named explicitly so the post-teacher rebuild can carry them into the emitted
+#: manifest -- ``build_report`` runs after dedup and could never recompute them
+#: -- and so a check that stopped producing them fails here with a ``KeyError``
+#: rather than quietly dropping out of the governance record.
+PRE_DEDUP_LEAK_KEYS = ("user_text_duplicate_leaks", "user_text_duplicate_leak_count")
 
 #: The transcript validator bound to this domain's tool registry, passed to
 #: both teacher entry points so a rewrite that somehow disturbed a tool call
@@ -163,10 +174,12 @@ CHECKER_RULES = (
     no_extra_keys({"record_id", "immutable_hash", "fields"}),
     min_words("final_response", 7),
     banned_pattern("final_response", BANNED_WORDING),
+    # No `exempt=`: see GOVERNED_PAIR_EXEMPTION. A governed pair may share its
+    # user turn; two identical finals are a defect in it like anywhere else, and
+    # the checker has to agree with the release gate about that.
     unique_normalized(
         "final_response",
         record_value=lambda record: record.get("final_response"),
-        exempt=GOVERNED_PAIR_EXEMPTION,
     ),
     opening_ngram_cap("final_response", lambda pair: str(pair.record.get("example_kind", ""))),
 )
@@ -204,6 +217,11 @@ def build(
         pre_dedup_checks=(_duplicate_user_text_check,),
         **REPORT_KWARGS,
     )
+
+    # compose merges its pre-dedup findings into its own report, but
+    # build_report cannot recompute them (they are about the rows before
+    # deduplication), so carry them by hand into the report that is emitted.
+    pre_dedup_leakage = {key: report["leakage"][key] for key in PRE_DEDUP_LEAK_KEYS}
 
     # Frozen splits are never sent to a teacher: their wording is the
     # regression, and rewriting it would rewrite the test.
@@ -264,6 +282,7 @@ def build(
         splits,
         cross_split_duplicates_removed=report["cross_split_duplicates_removed"],
         within_split_duplicates_removed=report["within_split_duplicates_removed"],
+        extra_leakage=pre_dedup_leakage,
         **REPORT_KWARGS,
     )
 

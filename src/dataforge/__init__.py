@@ -53,10 +53,13 @@ from dataforge.emit import (
     write_source_lock,
 )
 from dataforge.guards import (
+    banned_wording_leaks,
     count_pii_matches,
+    duplicate_text_leaks,
     heldout_leaks,
     leakage_report,
     paired_counterfactual_exemption,
+    secondary_field_leaks,
 )
 from dataforge.rows import (
     CONVERSATION_DERIVED_FIELDS,
@@ -102,6 +105,7 @@ __all__ = [
     "TaxonomyError",
     "TeacherRealizationError",
     "banned_pattern",
+    "banned_wording_leaks",
     "build_batch",
     "build_report",
     "check_teacher_batch",
@@ -111,6 +115,7 @@ __all__ = [
     "curriculum",
     "default_gates",
     "default_registry",
+    "duplicate_text_leaks",
     "export_teacher_requests",
     "fields_present",
     "format_findings",
@@ -136,6 +141,7 @@ __all__ = [
     "render_conversation_text",
     "row_rule",
     "scrub_fields",
+    "secondary_field_leaks",
     "splits_fingerprint",
     "summarize",
     "unique_normalized",

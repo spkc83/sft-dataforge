@@ -942,6 +942,28 @@ def test_conversation_final_response_projection_excludes_exactly_final_and_messa
         assert _exported_hash(mutated, editable, tmp_path / f"{field}.jsonl") != baseline, message
 
 
+def test_conversation_context_projection_excludes_has_context(tmp_path: Path) -> None:
+    """`has_context` is declared derived, so a caller who makes the context
+    editable is not rejected for a flag their `rederive` correctly updated.
+
+    The narrow projection is unaffected -- the test above asserts `has_context`
+    still moves the hash under `editable_fields=("final_response",)` -- so this
+    declaration widens nothing the teacher can reach.
+    """
+    editable = ["context_messages"]
+    base = _conversation_record()
+    baseline = _exported_hash(base, editable, tmp_path / "base.jsonl")
+
+    flag_only = _conversation_record()
+    flag_only["has_context"] = not flag_only["has_context"]
+    assert _exported_hash(flag_only, editable, tmp_path / "flag.jsonl") == baseline
+
+    # ...but a field this projection does not cover still pins the hash.
+    calls_only = _conversation_record()
+    calls_only["action_turns"] = []
+    assert _exported_hash(calls_only, editable, tmp_path / "calls.jsonl") != baseline
+
+
 def test_conversation_user_text_projection_also_excludes_text(tmp_path: Path) -> None:
     editable = ["user_text", "final_response"]
     base = _conversation_record()

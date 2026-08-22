@@ -198,6 +198,13 @@ def duplicate_text_leaks(
     mutated. See :func:`paired_counterfactual_exemption` for the exemption
     this was built for.
 
+    The stamped split is **the key this function iterated**, i.e. where the row
+    actually sits. :func:`dataforge.checks.unique_normalized` stamps the same
+    field from the record's own ``source_split`` instead, having no split map to
+    iterate; the two agree only while every row's ``source_split`` matches its
+    real split. When they can diverge, pass ``split_of=`` there so one exemption
+    predicate is not answering two different questions.
+
     Keys are ``{field}_duplicate_leaks`` (entries
     ``{"normalized", "members": [{"split", "group_id"}]}``) and
     ``{field}_duplicate_leak_count``.
