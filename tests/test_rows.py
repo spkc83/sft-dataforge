@@ -692,6 +692,38 @@ _BAD_CONTEXT_CASES: list[tuple[str, list, str]] = [
         [_context_tool_pair("r1", 0)[0], *_context_tool_pair("r1", 1)],
         "tool result correlation mismatch",
     ),
+    (
+        "trainable context assistant turn",
+        [
+            {"role": "user", "content": "which cards do I have", "loss": False},
+            {"role": "assistant", "content": "One debit card.", "loss": True},
+        ],
+        "context message is labeled",
+    ),
+    (
+        "assistant with an empty tool_calls list",
+        [{"role": "assistant", "content": "no call here", "loss": False, "tool_calls": []}],
+        "must contain exactly one call",
+    ),
+    (
+        "error payload with the wrong keys",
+        [
+            _context_tool_pair("r1", 0)[0],
+            {
+                **_context_tool_pair("r1", 0)[1],
+                "content": {"ok": False, "error": {"code": "not_found"}},
+            },
+        ],
+        "error envelope is invalid",
+    ),
+    (
+        "error payload that is not an object",
+        [
+            _context_tool_pair("r1", 0)[0],
+            {**_context_tool_pair("r1", 0)[1], "content": {"ok": False, "error": "boom"}},
+        ],
+        "error envelope is invalid",
+    ),
 ]
 
 
@@ -795,3 +827,51 @@ def test_validate_conversation_messages_ignores_context_calls_in_expected() -> N
     row = _conversation_row(context_messages=_context_tool_pair("r1", 0))
     assert row["expected_tool_calls"] == [{"name": "freeze_card", "arguments": {"last4": "1792"}}]
     validate_conversation_row(row)  # no raise
+
+
+def test_validate_conversation_row_accepts_an_error_envelope() -> None:
+    row = _conversation_row(
+        action_turns=[
+            _tool_turn(result={"ok": False, "error": {"code": "not_found", "message": "no card"}})
+        ]
+    )
+    assert row["messages"][2]["content"] == {
+        "ok": False,
+        "error": {"code": "not_found", "message": "no card"},
+    }
+
+
+def test_validate_conversation_messages_allows_the_final_assistant_to_be_trainable() -> None:
+    """The `loss: false` rule for plain assistants applies to *context* turns:
+    the last message is the one trainable prose turn and must stay `loss: true`."""
+    row = _conversation_row(
+        context_messages=[
+            {"role": "user", "content": "which cards do I have", "loss": False},
+            {"role": "assistant", "content": "One debit card.", "loss": False},
+        ]
+    )
+    assert row["messages"][-1]["loss"] is True
+    validate_conversation_row(row)  # no raise
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_message"),
+    [
+        ({"user_text": "  "}, "r5 user_text must be a non-empty string"),
+        ({"final_response": ""}, "r5 final_response must be a non-empty string"),
+    ],
+    ids=["blank user_text", "blank final_response"],
+)
+def test_render_conversation_input_errors_name_the_record(
+    kwargs: dict, expected_message: str
+) -> None:
+    call: dict = {
+        "record_id": "r5",
+        "context_messages": [],
+        "user_text": "freeze it",
+        "action_turns": [],
+        "final_response": "Done.",
+    }
+    call.update(kwargs)
+    with pytest.raises(ValueError, match=expected_message):
+        render_conversation(**call)
