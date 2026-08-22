@@ -30,7 +30,8 @@ from dataforge.checks import (
 )
 from dataforge.guards import paired_counterfactual_exemption
 
-HASH = "sha256:abc"
+HASH = "sha256:" + "a" * 64
+OTHER_HASH = "sha256:" + "b" * 64
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> Path:
@@ -202,6 +203,16 @@ def test_a_missing_jsonl_file_raises_checker_input_error(tmp_path: Path) -> None
         check_teacher_batch(tmp_path / "nope.jsonl", tmp_path / "nope.jsonl", [], ())
 
 
+def test_a_malformed_json_line_raises_a_json_decode_error(tmp_path: Path) -> None:
+    """The decoder's own diagnostics beat anything the checker could rewrap;
+    both it and CheckerInputError are ValueErrors, so one except covers both."""
+    path = tmp_path / "responses.jsonl"
+    path.write_text('{"record_id": "r1"\n', encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError) as caught:
+        check_teacher_batch(_write_jsonl(tmp_path / "requests.jsonl", []), path, [], ())
+    assert isinstance(caught.value, ValueError)
+
+
 def test_a_non_object_jsonl_row_raises_checker_input_error(tmp_path: Path) -> None:
     path = tmp_path / "responses.jsonl"
     path.write_text("[1, 2]\n", encoding="utf-8")
@@ -214,7 +225,7 @@ def test_content_defects_accumulate_instead_of_raising(tmp_path: Path) -> None:
         tmp_path,
         requests=[_request("r1"), _request("r2")],
         responses=[
-            _response("r1", final="short", hash_value="sha256:other"),
+            _response("r1", final="short", hash_value=OTHER_HASH),
             _response("r2", final="also short"),
         ],
         records=[_record("r1"), _record("r2")],
@@ -285,11 +296,65 @@ def test_hash_pinned_passes_a_pinned_response_and_flags_a_moved_hash(tmp_path: P
     findings = _run(
         tmp_path,
         requests=[_request("r1")],
-        responses=[_response("r1", final="fine", hash_value="sha256:moved")],
+        responses=[_response("r1", final="fine", hash_value=OTHER_HASH)],
         records=[_record("r1")],
         rules=(hash_pinned(),),
     )
     assert findings == [Finding("r1", "hash_pinned", "immutable_hash mismatch")]
+
+
+def test_hash_pinned_flags_a_hash_missing_from_the_response(tmp_path: Path) -> None:
+    response = _response("r1", final="fine")
+    del response["immutable_hash"]
+    findings = _run(
+        tmp_path,
+        requests=[_request("r1")],
+        responses=[response],
+        records=[_record("r1")],
+        rules=(hash_pinned(),),
+    )
+    assert findings == [Finding("r1", "hash_pinned", "immutable_hash missing on response")]
+
+
+def test_hash_pinned_flags_a_hash_missing_from_the_request(tmp_path: Path) -> None:
+    """Two absent hashes must not compare equal into a clean row."""
+    request = _request("r1")
+    del request["immutable_hash"]
+    response = _response("r1", final="fine")
+    del response["immutable_hash"]
+    findings = _run(
+        tmp_path,
+        requests=[request],
+        responses=[response],
+        records=[_record("r1")],
+        rules=(hash_pinned(),),
+    )
+    assert findings == [
+        Finding("r1", "hash_pinned", "immutable_hash missing on request"),
+        Finding("r1", "hash_pinned", "immutable_hash missing on response"),
+    ]
+
+
+def test_hash_pinned_flags_a_hash_that_is_not_sha256_hex(tmp_path: Path) -> None:
+    findings = _run(
+        tmp_path,
+        requests=[_request("r1", hash_value="sha256:abc")],
+        responses=[_response("r1", final="fine", hash_value="sha256:abc")],
+        records=[_record("r1")],
+        rules=(hash_pinned(),),
+    )
+    assert findings == [Finding("r1", "hash_pinned", "immutable_hash is not sha256:<64 hex>")]
+
+
+def test_hash_pinned_flags_a_non_string_hash(tmp_path: Path) -> None:
+    findings = _run(
+        tmp_path,
+        requests=[_request("r1")],
+        responses=[_response("r1", final="fine", immutable_hash=1234)],
+        records=[_record("r1")],
+        rules=(hash_pinned(),),
+    )
+    assert findings == [Finding("r1", "hash_pinned", "immutable_hash missing on response")]
 
 
 def test_fields_present_flags_a_missing_and_a_blank_field(tmp_path: Path) -> None:
@@ -523,8 +588,7 @@ def test_unique_normalized_flags_two_rewrites_that_collide(tmp_path: Path) -> No
         rules=(unique_normalized("final_response", record_value=_final_of),),
     )
     assert findings == [
-        Finding("r1", "unique_normalized", "duplicates the rewrite of r2"),
-        Finding("r2", "unique_normalized", "duplicates the rewrite of r1"),
+        Finding("r2", "unique_normalized", "final_response duplicates the rewrite of r1"),
     ]
 
 
@@ -539,7 +603,56 @@ def test_unique_normalized_flags_a_rewrite_colliding_with_an_untouched_record(
         rules=(unique_normalized("final_response", record_value=_final_of),),
     )
     assert findings == [
-        Finding("r1", "unique_normalized", "duplicates untouched record r2"),
+        Finding("r1", "unique_normalized", "final_response duplicates untouched record r2"),
+    ]
+
+
+def test_unique_normalized_details_name_the_field_so_two_instances_stay_distinct(
+    tmp_path: Path,
+) -> None:
+    """Without the field prefix the two rules' details would be byte-identical
+    and `check_teacher_batch`'s dedup would collapse them into one finding."""
+    record_ids = ["r1", "r2", "r3"]
+    responses = [
+        _response(
+            record_id,
+            final="unused",
+            fields={"final_response": "the same final", "user_text": "the same user turn"},
+        )
+        for record_id in record_ids
+    ]
+    findings = _run(
+        tmp_path,
+        requests=[_request(record_id) for record_id in record_ids],
+        responses=responses,
+        records=[
+            _record(record_id, user_text=f"user turn {record_id}") for record_id in record_ids
+        ],
+        rules=(
+            unique_normalized("final_response", record_value=_final_of),
+            unique_normalized("user_text", record_value=lambda record: record.get("user_text")),
+        ),
+    )
+    assert findings == [
+        Finding("r2", "unique_normalized", "final_response duplicates the rewrite of r1"),
+        Finding("r2", "unique_normalized", "user_text duplicates the rewrite of r1"),
+        Finding("r3", "unique_normalized", "final_response duplicates the rewrite of r1"),
+        Finding("r3", "unique_normalized", "user_text duplicates the rewrite of r1"),
+    ]
+
+
+def test_unique_normalized_flags_every_rewrite_after_the_lowest_record_id(tmp_path: Path) -> None:
+    record_ids = ["r3", "r1", "r2"]
+    findings = _run(
+        tmp_path,
+        requests=[_request(record_id) for record_id in record_ids],
+        responses=[_response(record_id, final="the same final") for record_id in record_ids],
+        records=[_record(record_id) for record_id in record_ids],
+        rules=(unique_normalized("final_response", record_value=_final_of),),
+    )
+    assert findings == [
+        Finding("r2", "unique_normalized", "final_response duplicates the rewrite of r1"),
+        Finding("r3", "unique_normalized", "final_response duplicates the rewrite of r1"),
     ]
 
 
@@ -616,7 +729,9 @@ def test_unique_normalized_still_flags_a_pair_that_is_not_governed(tmp_path: Pat
             ),
         ),
     )
-    assert [finding.record_id for finding in findings] == ["r1", "r2"]
+    assert findings == [
+        Finding("r2", "unique_normalized", "final_response duplicates the rewrite of r1"),
+    ]
 
 
 def test_unique_normalized_stamps_the_split_the_exemption_reads(tmp_path: Path) -> None:
@@ -710,7 +825,7 @@ def test_opening_ngram_cap_flags_every_member_of_an_over_cap_family(tmp_path: Pa
     )
     assert [finding.record_id for finding in findings] == ["r1", "r2", "r3", "r4", "r5"]
     assert {finding.detail for finding in findings} == {
-        "opening 3-gram 'i have frozen' used 5 times in cards"
+        "final_response opening 3-gram 'i have frozen' used 5 times in cards"
     }
 
 
@@ -787,7 +902,7 @@ def test_opening_ngram_cap_honours_n_and_max_uses(tmp_path: Path) -> None:
         rules=(opening_ngram_cap("final_response", _family_of, n=2, max_uses=1),),
     )
     assert [finding.record_id for finding in findings] == ["r1", "r2"]
-    assert findings[0].detail == "opening 2-gram 'i have' used 2 times in cards"
+    assert findings[0].detail == "final_response opening 2-gram 'i have' used 2 times in cards"
 
 
 # --------------------------------------------------------------------------
