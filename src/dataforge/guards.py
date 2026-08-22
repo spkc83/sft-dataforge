@@ -252,8 +252,11 @@ def paired_counterfactual_exemption(
     1. its size is even and at least 2;
     2. it partitions by ``pair_field`` into pairs of **exactly two** rows (a
        row with a missing/empty ``pair_field`` disqualifies the bucket);
-    3. the two rows of every pair carry **distinct** ``target_field`` values,
-       i.e. the same utterance genuinely resolves differently;
+    3. both rows of every pair carry a **present and distinct** ``target_field``
+       value, i.e. the same utterance genuinely resolves differently. A
+       missing, ``None`` or empty target disqualifies the bucket rather than
+       counting as a second distinct value against its partner's real one --
+       it is evidence of a malformed pair, not of a counterfactual;
     4. every row sits in **one** split -- a counterfactual pair is a
        within-split construction, so the same text appearing in two splits is
        leakage, never an exemptible pair. The split is read from
@@ -283,7 +286,10 @@ def paired_counterfactual_exemption(
         for members in pairs.values():
             if len(members) != 2:
                 return False
-            if len({canonical_json_bytes(row.get(target_field)) for row in members}) != 2:
+            targets = [row.get(target_field) for row in members]
+            if any(target is None or target == "" for target in targets):
+                return False
+            if len({canonical_json_bytes(target) for target in targets}) != 2:
                 return False
             projections = sorted(
                 canonical_json_bytes({name: row.get(name) for name in context_fields}).decode()
