@@ -329,9 +329,9 @@ def render_conversation(
     if not isinstance(record_id, str) or not record_id:
         raise ValueError("record_id must be a non-empty string")
     if not isinstance(user_text, str) or not user_text.strip():
-        raise ValueError("user_text must be a non-empty string")
+        raise ValueError(f"{record_id} user_text must be a non-empty string")
     if not isinstance(final_response, str) or not final_response.strip():
-        raise ValueError("final_response must be a non-empty string")
+        raise ValueError(f"{record_id} final_response must be a non-empty string")
 
     messages: list[dict[str, Any]] = [dict(deepcopy(message)) for message in context_messages]
     messages.append({"role": "user", "content": user_text.strip(), "loss": False})
@@ -503,17 +503,21 @@ def validate_conversation_messages(
     object arguments inside the whitelist; each call answered by the
     immediately following ``tool`` message with a matching ``tool_call_id``, an
     unlabeled ``loss``, and an envelope whose key set is exactly ``{ok, result}``
-    or ``{ok, error}``; unlabeled ``system``/``user`` turns; no call left
-    pending; and a trainable ``assistant`` final turn last.
+    or ``{ok, error}`` (an error payload being itself exactly
+    ``{"code", "message"}``); unlabeled ``system``/``user`` turns and unlabeled
+    plain ``assistant`` turns anywhere but last -- every context turn is
+    ``loss: false``, and the final turn is the only trainable prose; no call
+    left pending; and a trainable ``assistant`` final turn last.
     """
     pending_call_id: str | None = None
     seen_call_ids: set[str] = set()
     trainable_call_ids: list[str] = []
     context_call_ids: list[str] = []
     canonical_calls: list[dict[str, Any]] = []
-    for message in messages:
+    last_index = len(messages) - 1
+    for index, message in enumerate(messages):
         role = message.get("role")
-        if role == "assistant" and message.get("tool_calls"):
+        if role == "assistant" and "tool_calls" in message:
             if pending_call_id is not None:
                 raise ValueError(f"{record_id} tool result correlation mismatch")
             tool_calls = message["tool_calls"]
@@ -572,8 +576,14 @@ def validate_conversation_messages(
             ok = content.get("ok")
             if ok is True and set(content) != {"ok", "result"}:
                 raise ValueError(f"{record_id} success envelope is invalid")
-            if ok is False and set(content) != {"ok", "error"}:
-                raise ValueError(f"{record_id} error envelope is invalid")
+            if ok is False:
+                error = content.get("error")
+                if (
+                    set(content) != {"ok", "error"}
+                    or not isinstance(error, Mapping)
+                    or set(error) != {"code", "message"}
+                ):
+                    raise ValueError(f"{record_id} error envelope is invalid")
             if ok is not True and ok is not False:
                 raise ValueError(f"{record_id} tool envelope missing ok")
             if pending_call_id is None or message.get("tool_call_id") != pending_call_id:
@@ -585,6 +595,8 @@ def validate_conversation_messages(
             loss = message.get("loss")
             if loss is not True and loss is not False:
                 raise ValueError(f"{record_id} assistant message has invalid loss label")
+            if index != last_index and loss is not False:
+                raise ValueError(f"{record_id} context message is labeled")
         elif role in {"system", "user"}:
             if pending_call_id is not None:
                 raise ValueError(f"{record_id} tool result correlation mismatch")
