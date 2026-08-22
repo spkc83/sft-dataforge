@@ -39,10 +39,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from dataforge.emit import file_sha256
 from dataforge.rows import DERIVED_FIELDS, canonical_json_bytes, validate_row_consistency
 
 #: Sentinel default for `validate`: resolves to `validate_row_consistency`
@@ -58,13 +59,31 @@ class TeacherRealizationError(ValueError):
     field outside its ``allowed_edits``, or leaves a derived field stale."""
 
 
-def immutable_hash(record: Mapping[str, Any], editable_fields: Sequence[str]) -> str:
+def immutable_hash(
+    record: Mapping[str, Any],
+    editable_fields: Sequence[str],
+    *,
+    provenance_field: str = "provenance",
+) -> str:
     """Hash a record's non-editable projection.
 
     Two records with the same immutable hash are guaranteed to differ, if
-    at all, only within ``editable_fields``.
+    at all, only within ``editable_fields`` and ``provenance_field``.
+
+    ``provenance_field`` is excluded because provenance is *written onto* a
+    record by the very pipeline the hash protects: :func:`import_teacher_responses`
+    stamps ``teacher_model``/``teacher_prompt_hash``/``teacher_realization_hash``,
+    and :func:`scrub_fields` stamps ``pre_scrub_immutable_hashes``. If those
+    stamps were hashed, a record's own hash would move the moment it was
+    realized, so exporting a second round of teacher requests from realized
+    records would invalidate every request already in flight. Keeping
+    provenance outside the projection is what makes export -> import -> export
+    idempotent -- and it is also what makes the pre-scrub stamps *claims*
+    rather than proofs (see :func:`import_teacher_responses`).
     """
-    projection = {key: value for key, value in record.items() if key not in editable_fields}
+    excluded = set(editable_fields)
+    excluded.add(provenance_field)
+    projection = {key: value for key, value in record.items() if key not in excluded}
     return f"sha256:{hashlib.sha256(canonical_json_bytes(projection)).hexdigest()}"
 
 
@@ -131,6 +150,7 @@ def export_teacher_requests(
     *,
     editable_fields: Sequence[str],
     record_id_field: str = "record_id",
+    provenance_field: str = "provenance",
     instructions: str = "Rewrite only the listed fields for fluency; do not change their meaning.",
     derived_fields: Mapping[str, Sequence[str]] = DERIVED_FIELDS,
     rederive: Callable[[dict[str, Any]], None] | None = None,
@@ -143,7 +163,8 @@ def export_teacher_requests(
     ``derived_fields``/``rederive``/``validate`` must match whatever will be
     passed to the later :func:`import_teacher_responses` call, so the two
     agree on what is (and isn't) covered by ``immutable_hash``; see
-    :func:`_resolve_wiring`.
+    :func:`_resolve_wiring`. ``provenance_field`` must match too: it names the
+    key :func:`immutable_hash` leaves out of the projection.
     """
     excluded_fields, _validate = _resolve_wiring(
         editable_fields, derived_fields, rederive, validate
@@ -154,12 +175,173 @@ def export_teacher_requests(
             record_id = record[record_id_field]
             row = {
                 "record_id": record_id,
-                "immutable_hash": immutable_hash(record, excluded_fields),
+                "immutable_hash": immutable_hash(
+                    record, excluded_fields, provenance_field=provenance_field
+                ),
                 "fields": {field: record.get(field) for field in editable_fields},
                 "allowed_edits": list(editable_fields),
                 "instructions": instructions,
             }
             handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _apply_substitutions(text: str, substitutions: Sequence[tuple[str, str]]) -> str:
+    for old, new in substitutions:
+        text = text.replace(old, new)
+    return text
+
+
+def scrub_fields(
+    record: MutableMapping[str, Any],
+    substitutions: Sequence[tuple[str, str]],
+    *,
+    fields: Sequence[str],
+    editable_fields: Sequence[str],
+    message_roles: Collection[str] = ("user", "assistant"),
+    provenance_field: str = "provenance",
+    derived_fields: Mapping[str, Sequence[str]] = DERIVED_FIELDS,
+    rederive: Callable[[dict[str, Any]], None] | None = None,
+    validate: Callable[[Mapping[str, Any]], None] | None = _AUTO_VALIDATE,  # type: ignore[assignment]
+) -> bool:
+    """Rewrite literal substrings in non-editable ``fields``, in place.
+
+    A scrub is the pipeline's own edit of text the *teacher* may not touch:
+    house-style fixes, product-surface names, wording that betrays a synthetic
+    corpus. Each ``(old, new)`` pair is applied with plain :meth:`str.replace`
+    in order. ``fields`` may name plain string fields or message-list fields
+    (a list of ``{"role", "content"}`` dicts, of which only the ``content`` of
+    messages whose ``role`` is in ``message_roles`` is scrubbed -- system and
+    tool turns are left alone). Returns whether any string actually changed.
+
+    Refuses (:class:`TeacherRealizationError`) any field that is also in
+    ``editable_fields``: editable text belongs to the teacher, and scrubbing it
+    behind the teacher's back both races the realization and defeats the point
+    of the hash. Constrain the teacher's own output instead (e.g. a
+    banned-pattern check over the returned fields).
+
+    Scrubbing a field that *feeds* a derived field requires the same
+    ``rederive`` + ``validate`` wiring the teacher path requires, for the same
+    reason: otherwise the derived field silently goes stale. When the scrub
+    changed something and a derived field is affected, ``rederive`` and then
+    ``validate`` run against the scrubbed record.
+
+    **Stamping.** A scrub can touch fields the immutable hash covers, which
+    would invalidate teacher request files already exported against the old
+    hash. When the hash moves, an entry
+    ``{"before_hash", "after_hash", "excluded_fields"}`` is appended to
+    ``record[provenance_field]["pre_scrub_immutable_hashes"]`` (created if
+    absent; never rewritten or truncated, so a chain of scrubs keeps every
+    hash the record ever had). Both hashes and the ``excluded_fields`` tag are
+    computed from the **teacher's** projection -- ``editable_fields`` plus the
+    derived fields *they* affect -- i.e. the exact exclusion set
+    :func:`import_teacher_responses` recomputes, not the projection implied by
+    the scrubbed ``fields``. ``after_hash`` is informational; only
+    ``before_hash`` and the tag are matched on import, and only when the
+    importer is asked to trust the stamps (``accept_pre_scrub_hashes=True``).
+    """
+    overlap = set(fields) & set(editable_fields)
+    if overlap:
+        raise TeacherRealizationError(
+            f"cannot scrub editable field(s) {sorted(overlap)}: editable text belongs to the "
+            "teacher, so scrubbing it here would race the realization and be overwritten by it; "
+            "constrain the teacher's own output instead (e.g. a banned-pattern check on the "
+            "returned fields), or drop those fields from editable_fields"
+        )
+    # Two wiring calls, two purposes. This one only enforces that scrubbing a
+    # field which feeds a derived field brings rederive + validate along.
+    _scrub_excluded, scrub_validate = _resolve_wiring(fields, derived_fields, rederive, validate)
+    scrub_affects_derived = bool(_affected_derived_fields(fields, derived_fields))
+    # This one reproduces the teacher's projection, so the stamped hashes and
+    # the tag match what import_teacher_responses will compute.
+    teacher_excluded, _teacher_validate = _resolve_wiring(
+        editable_fields, derived_fields, rederive, validate
+    )
+
+    before_hash = immutable_hash(record, teacher_excluded, provenance_field=provenance_field)
+    changed = False
+    for field in fields:
+        value = record.get(field)
+        if isinstance(value, str):
+            scrubbed = _apply_substitutions(value, substitutions)
+            if scrubbed != value:
+                record[field] = scrubbed
+                changed = True
+        elif isinstance(value, list):
+            for message in value:
+                if not isinstance(message, MutableMapping):
+                    continue
+                if message.get("role") not in message_roles:
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                scrubbed = _apply_substitutions(content, substitutions)
+                if scrubbed != content:
+                    message["content"] = scrubbed
+                    changed = True
+
+    if changed and scrub_affects_derived:
+        if rederive is not None:
+            rederive(record)  # type: ignore[arg-type]
+        if scrub_validate is not None:
+            scrub_validate(record)
+
+    after_hash = immutable_hash(record, teacher_excluded, provenance_field=provenance_field)
+    if after_hash != before_hash:
+        provenance = record.get(provenance_field)
+        if provenance is None:
+            provenance = {}
+            record[provenance_field] = provenance
+        elif not isinstance(provenance, MutableMapping):
+            raise TeacherRealizationError(
+                f"cannot stamp a pre-scrub hash: {provenance_field!r} is "
+                f"{type(provenance).__name__}, not a mutable mapping"
+            )
+        stamps = provenance.get("pre_scrub_immutable_hashes")
+        if stamps is None:
+            stamps = []
+            provenance["pre_scrub_immutable_hashes"] = stamps
+        elif not isinstance(stamps, list):
+            raise TeacherRealizationError(
+                "cannot stamp a pre-scrub hash: "
+                f"{provenance_field}['pre_scrub_immutable_hashes'] is "
+                f"{type(stamps).__name__}, not a list"
+            )
+        stamps.append(
+            {
+                "before_hash": before_hash,
+                "after_hash": after_hash,
+                "excluded_fields": sorted(teacher_excluded),
+            }
+        )
+    return changed
+
+
+def _stamped_pre_scrub_hashes(
+    record: Mapping[str, Any],
+    excluded_fields: Sequence[str],
+    provenance_field: str,
+) -> set[str]:
+    """Pre-scrub hashes stamped on ``record`` for *this* hash projection.
+
+    Entries tagged with a different ``excluded_fields`` set describe a
+    different hash and are ignored -- accepting them would let a stamp written
+    for a narrow projection unlock a request pinned to a wide one.
+    """
+    provenance = record.get(provenance_field)
+    if not isinstance(provenance, Mapping):
+        return set()
+    stamps = provenance.get("pre_scrub_immutable_hashes")
+    if not isinstance(stamps, list):
+        return set()
+    tag = sorted(excluded_fields)
+    return {
+        entry["before_hash"]
+        for entry in stamps
+        if isinstance(entry, Mapping)
+        and entry.get("excluded_fields") == tag
+        and isinstance(entry.get("before_hash"), str)
+    }
 
 
 def import_teacher_responses(
@@ -171,6 +353,7 @@ def import_teacher_responses(
     teacher_prompt_hash: str,
     record_id_field: str = "record_id",
     provenance_field: str = "provenance",
+    accept_pre_scrub_hashes: bool = False,
     derived_fields: Mapping[str, Sequence[str]] = DERIVED_FIELDS,
     rederive: Callable[[dict[str, Any]], None] | None = None,
     validate: Callable[[Mapping[str, Any]], None] | None = _AUTO_VALIDATE,  # type: ignore[assignment]
@@ -193,6 +376,28 @@ def import_teacher_responses(
     immutable-hash comparison. Pass ``derived_fields={}`` to opt out of this
     guard entirely (the caller then owns the consistency of any derived
     field on their own).
+
+    ``accept_pre_scrub_hashes`` widens **only** the request-side check: a
+    response row may then pin either the record's live hash or the
+    ``before_hash`` of any :func:`scrub_fields` stamp on the record whose
+    ``excluded_fields`` tag matches this call's projection. This is how a
+    teacher file exported before a scrub stays usable after it. The widening
+    is strictly one-directional: the post-edit check still compares against
+    the record's *live* hash, so the record's own semantics still cannot move.
+    There is deliberately no chain or after-hash condition -- a later benign
+    mutation (stamping an id, a second scrub) must not lock the old teacher
+    file out, which is the whole point of the mechanism.
+
+    **Trust boundary.** ``provenance`` is outside the hash (that is what makes
+    it writable at all) and :func:`scrub_fields` is public, so a stamp
+    certifies nothing by itself: anything that can write the record's
+    provenance can mint a stamp for any hash it likes, and this importer will
+    then accept a teacher file pinned to that hash. Passing
+    ``accept_pre_scrub_hashes=True`` therefore does not mean "the library
+    verified a scrub happened"; it means "I trust every step that could write
+    provenance between export and import". Keep the default ``False``
+    (identical to the pre-flag behaviour: exactly one acceptable request hash,
+    recomputed live) unless the pipeline in between is yours.
     """
     excluded_fields, validate = _resolve_wiring(editable_fields, derived_fields, rederive, validate)
     responses = {row["record_id"]: row for row in _read_jsonl(path)}
@@ -202,8 +407,11 @@ def import_teacher_responses(
         row = responses.get(record_id)
         if row is None:
             continue
-        before_hash = immutable_hash(record, excluded_fields)
-        if row.get("immutable_hash") != before_hash:
+        before_hash = immutable_hash(record, excluded_fields, provenance_field=provenance_field)
+        accepted_hashes = {before_hash}
+        if accept_pre_scrub_hashes:
+            accepted_hashes |= _stamped_pre_scrub_hashes(record, excluded_fields, provenance_field)
+        if row.get("immutable_hash") not in accepted_hashes:
             raise TeacherRealizationError(f"{record_id} teacher request hash mismatch")
         fields = row.get("fields")
         if not isinstance(fields, Mapping):
@@ -226,16 +434,39 @@ def import_teacher_responses(
                 raise TeacherRealizationError(
                     f"{record_id} failed post-application validation: {error}"
                 ) from error
-        if immutable_hash(record, excluded_fields) != before_hash:
+        # Post-edit: the *live* hash, never a stamped one (see the docstring's
+        # one-directional widening).
+        after_hash = immutable_hash(record, excluded_fields, provenance_field=provenance_field)
+        if after_hash != before_hash:
             raise TeacherRealizationError(
                 f"{record_id} teacher response changed immutable semantics"
             )
         provenance = dict(record.get(provenance_field, {}))
         provenance["teacher_model"] = teacher_model
         provenance["teacher_prompt_hash"] = teacher_prompt_hash
-        provenance["teacher_realization_hash"] = immutable_hash(row, [])
+        provenance["teacher_realization_hash"] = immutable_hash(
+            row, [], provenance_field=provenance_field
+        )
         record[provenance_field] = provenance
     return realized
+
+
+def compute_teacher_prompt_hash(prompt_path: Path, request_path: Path) -> str:
+    """Digest the teacher prompt spec plus the request file sent with it.
+
+    ``teacher_prompt_hash`` is an opaque provenance string as far as
+    :func:`import_teacher_responses` is concerned -- the library never
+    recomputes or verifies it. This is an explicit, reproducible definition of
+    it for callers who want one: ``"sha256:"`` + sha256 over the canonical JSON
+    of ``{"prompt_sha256": ..., "requests_sha256": ...}``, so it moves when
+    either the prompt spec or the exact set of requests moves, and neither file
+    has to be kept around to re-verify the pairing later.
+    """
+    payload = {
+        "prompt_sha256": file_sha256(prompt_path),
+        "requests_sha256": file_sha256(request_path),
+    }
+    return f"sha256:{hashlib.sha256(canonical_json_bytes(payload)).hexdigest()}"
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

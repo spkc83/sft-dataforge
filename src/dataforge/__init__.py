@@ -41,9 +41,11 @@ from dataforge.rows import (
 from dataforge.taxonomy import IntentSpec, Taxonomy, TaxonomyError
 from dataforge.teacher import (
     TeacherRealizationError,
+    compute_teacher_prompt_hash,
     export_teacher_requests,
     immutable_hash,
     import_teacher_responses,
+    scrub_fields,
 )
 
 __all__ = [
@@ -59,6 +61,7 @@ __all__ = [
     "TeacherRealizationError",
     "build_report",
     "compose",
+    "compute_teacher_prompt_hash",
     "count_pii_matches",
     "curriculum",
     "default_gates",
@@ -72,6 +75,7 @@ __all__ = [
     "normalize_text",
     "rederive_text",
     "render_context",
+    "scrub_fields",
     "splits_fingerprint",
     "validate_row_consistency",
     "verify_release_split_digests",
