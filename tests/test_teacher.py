@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 
 from dataforge.rows import (
     CONVERSATION_DERIVED_FIELDS,
+    canonical_json_bytes,
     make_conversation_row,
     make_row,
     rederive_conversation,
@@ -956,3 +958,123 @@ def test_conversation_user_text_projection_also_excludes_text(tmp_path: Path) ->
     calls_only = _conversation_record()
     calls_only["expected_tool_calls"] = []
     assert _exported_hash(calls_only, editable, tmp_path / "calls.jsonl") != baseline
+
+
+# --- teacher_realization_hash digests the whole response row ----------------
+
+
+def _response_row(**extra: object) -> dict:
+    row: dict[str, object] = {
+        "record_id": "r1",
+        "immutable_hash": immutable_hash(_record(), ["assistant_response"]),
+        "fields": {"assistant_response": "Here are your balances."},
+    }
+    row.update(extra)
+    return row
+
+
+def _realization_hash_for(row: dict, path: Path) -> str:
+    path.write_text(json.dumps(row) + "\n")
+    realized = import_teacher_responses(
+        [_record()],
+        path,
+        editable_fields=["assistant_response"],
+        teacher_model="stub",
+        teacher_prompt_hash="sha256:x",
+    )
+    return str(realized[0]["provenance"]["teacher_realization_hash"])
+
+
+def test_teacher_realization_hash_digests_the_whole_response_row(tmp_path: Path) -> None:
+    """It is a record of what the teacher actually returned, not a projection
+    of a record: no field is excluded from it, `provenance` included. A
+    response row carrying keys the importer ignores for control flow must
+    still move the digest, or keeping the digest is worth nothing."""
+    row = _response_row()
+    digest = _realization_hash_for(row, tmp_path / "plain.jsonl")
+    expected = f"sha256:{hashlib.sha256(canonical_json_bytes(row)).hexdigest()}"
+    assert digest == expected
+
+    with_provenance = _realization_hash_for(
+        _response_row(provenance={"teacher_notes": "smuggled"}), tmp_path / "prov.jsonl"
+    )
+    assert with_provenance != digest
+
+
+def test_teacher_realization_hash_moves_with_a_key_the_importer_ignores(tmp_path: Path) -> None:
+    with_extra = _realization_hash_for(
+        _response_row(allowed_edits=["assistant_response"]), tmp_path / "extra.jsonl"
+    )
+    assert with_extra != _realization_hash_for(_response_row(), tmp_path / "bare.jsonl")
+
+
+# --- the stamp tag is the *resolved* exclusion set --------------------------
+
+
+def _scrubbed_history_row_and_response(tmp_path: Path) -> tuple[dict, Path]:
+    """Export against `current_text` (which affects the derived `text`), then
+    scrub a hashed context field behind the request."""
+    row = _history_row()
+    requests_path = tmp_path / "req.jsonl"
+    export_teacher_requests(
+        [row], requests_path, editable_fields=["current_text"], rederive=rederive_text
+    )
+    request = json.loads(requests_path.read_text().splitlines()[0])
+    scrub_fields(
+        row,
+        APP,
+        fields=["history"],
+        editable_fields=["current_text"],
+        rederive=rederive_text,
+    )
+    responses_path = tmp_path / "resp.jsonl"
+    responses_path.write_text(
+        json.dumps(
+            {
+                "record_id": "g1",
+                "immutable_hash": request["immutable_hash"],
+                "fields": {"current_text": "please explain the overdraft policy"},
+            }
+        )
+        + "\n"
+    )
+    return row, responses_path
+
+
+def test_pre_scrub_stamp_matches_when_derived_fields_are_pinned_identically(
+    tmp_path: Path,
+) -> None:
+    row, responses_path = _scrubbed_history_row_and_response(tmp_path)
+    realized = import_teacher_responses(
+        [row],
+        responses_path,
+        editable_fields=["current_text"],
+        teacher_model="m",
+        teacher_prompt_hash="h",
+        rederive=rederive_text,
+        accept_pre_scrub_hashes=True,
+    )
+    assert realized[0]["current_text"] == "please explain the overdraft policy"
+
+
+def test_pre_scrub_stamp_does_not_match_when_derived_fields_differ(tmp_path: Path) -> None:
+    """The tag is the *resolved* exclusion set (editable_fields + the derived
+    fields they affect), so derived_fields has to be pinned between scrub and
+    import too -- not just editable_fields. Documented on both functions."""
+    row, responses_path = _scrubbed_history_row_and_response(tmp_path)
+    assert row["provenance"]["pre_scrub_immutable_hashes"][0]["excluded_fields"] == [
+        "current_text",
+        "text",
+    ]
+    with pytest.raises(TeacherRealizationError, match="hash mismatch"):
+        import_teacher_responses(
+            [row],
+            responses_path,
+            editable_fields=["current_text"],
+            teacher_model="m",
+            teacher_prompt_hash="h",
+            derived_fields={},
+            rederive=rederive_text,
+            validate=validate_row_consistency,
+            accept_pre_scrub_hashes=True,
+        )

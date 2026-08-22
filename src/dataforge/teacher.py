@@ -238,6 +238,13 @@ def scrub_fields(
     the scrubbed ``fields``. ``after_hash`` is informational; only
     ``before_hash`` and the tag are matched on import, and only when the
     importer is asked to trust the stamps (``accept_pre_scrub_hashes=True``).
+
+    Because the tag is the *resolved* exclusion set -- ``editable_fields`` plus
+    the derived fields they affect -- ``derived_fields`` must be pinned
+    identically here and at import, not just ``editable_fields``. A scrub
+    stamped under the default :data:`dataforge.rows.DERIVED_FIELDS` and an
+    import passing ``derived_fields={}`` resolve to different tags, so the
+    stamp will not match and the pre-scrub request will be rejected.
     """
     overlap = set(fields) & set(editable_fields)
     if overlap:
@@ -386,7 +393,13 @@ def import_teacher_responses(
     the record's *live* hash, so the record's own semantics still cannot move.
     There is deliberately no chain or after-hash condition -- a later benign
     mutation (stamping an id, a second scrub) must not lock the old teacher
-    file out, which is the whole point of the mechanism.
+    file out, which is the whole point of the mechanism. The tag compared is
+    the *resolved* exclusion set (``editable_fields`` plus the derived fields
+    they affect), so ``derived_fields`` -- not only ``editable_fields`` -- must
+    be pinned identically to whatever :func:`scrub_fields` was given: a scrub
+    stamped under the default :data:`dataforge.rows.DERIVED_FIELDS` and an
+    import passing ``derived_fields={}`` resolve to different tags and the
+    stamp will not match.
 
     **Trust boundary.** ``provenance`` is outside the hash (that is what makes
     it writable at all) and :func:`scrub_fields` is public, so a stamp
@@ -444,8 +457,13 @@ def import_teacher_responses(
         provenance = dict(record.get(provenance_field, {}))
         provenance["teacher_model"] = teacher_model
         provenance["teacher_prompt_hash"] = teacher_prompt_hash
-        provenance["teacher_realization_hash"] = immutable_hash(
-            row, [], provenance_field=provenance_field
+        # The realization hash digests the response row *whole* -- no field is
+        # excluded, not even `provenance_field`. This is a record of what the
+        # teacher actually returned, not a projection of a record: anything the
+        # response carried (extra keys the importer ignores for control flow
+        # included) has to be inside the digest for it to be worth keeping.
+        provenance["teacher_realization_hash"] = (
+            f"sha256:{hashlib.sha256(canonical_json_bytes(row)).hexdigest()}"
         )
         record[provenance_field] = provenance
     return realized
