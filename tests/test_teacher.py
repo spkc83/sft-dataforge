@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from dataforge.rows import make_row, rederive_text, validate_row_consistency
+from dataforge.rows import (
+    CONVERSATION_DERIVED_FIELDS,
+    make_conversation_row,
+    make_row,
+    rederive_conversation,
+    rederive_text,
+    validate_conversation_row,
+    validate_row_consistency,
+)
 from dataforge.teacher import (
     TeacherRealizationError,
     compute_teacher_prompt_hash,
@@ -713,3 +721,238 @@ def test_compute_teacher_prompt_hash_does_not_collide_when_the_files_swap(
     left.write_text("alpha\n")
     right.write_text("beta\n")
     assert compute_teacher_prompt_hash(left, right) != compute_teacher_prompt_hash(right, left)
+
+
+CONVERSATION_WIRING: dict = {
+    "derived_fields": CONVERSATION_DERIVED_FIELDS,
+    "rederive": rederive_conversation,
+    "validate": validate_conversation_row,
+}
+
+
+def _conversation_record(**overrides: object) -> dict:
+    kwargs: dict = {
+        "record_id": "c1",
+        "context_messages": [
+            {"role": "system", "content": "you are a bank agent", "loss": False},
+            {"role": "user", "content": "which cards do I have", "loss": False},
+            {"role": "assistant", "content": "One debit card ending 1792.", "loss": False},
+        ],
+        "user_text": "freeze it",
+        "action_turns": [
+            {
+                "name": "freeze_card",
+                "arguments": {"last4": "1792"},
+                "result": {"ok": True, "result": {"status": "frozen"}},
+            }
+        ],
+        "final_response": "Done. The card ending 1792 is frozen.",
+        "labels": {"intent": "freeze_card"},
+        "example_kind": "tool_success",
+        "source": "unit-test",
+        "source_split": "train",
+        "group_id": "c1",
+    }
+    kwargs.update(overrides)
+    return make_conversation_row(**kwargs)
+
+
+def _exported_hash(record: dict, editable_fields: list[str], path: Path) -> str:
+    export_teacher_requests([record], path, editable_fields=editable_fields, **CONVERSATION_WIRING)
+    return str(json.loads(path.read_text().splitlines()[0])["immutable_hash"])
+
+
+def _respond(request_path: Path, response_path: Path, fields: dict) -> None:
+    request = json.loads(request_path.read_text().splitlines()[0])
+    response_path.write_text(
+        json.dumps(
+            {
+                "record_id": request["record_id"],
+                "immutable_hash": request["immutable_hash"],
+                "fields": fields,
+            }
+        )
+        + "\n"
+    )
+
+
+def test_conversation_round_trip_rewrites_the_final_and_rerenders_the_transcript(
+    tmp_path: Path,
+) -> None:
+    record = _conversation_record()
+    requests_path = tmp_path / "req.jsonl"
+    responses_path = tmp_path / "resp.jsonl"
+    export_teacher_requests(
+        [record], requests_path, editable_fields=["final_response"], **CONVERSATION_WIRING
+    )
+    rewritten = "Your debit card ending 1792 is frozen, so nothing new can be charged to it."
+    _respond(requests_path, responses_path, {"final_response": rewritten})
+
+    realized = import_teacher_responses(
+        [record],
+        responses_path,
+        editable_fields=["final_response"],
+        teacher_model="stub",
+        teacher_prompt_hash="sha256:x",
+        **CONVERSATION_WIRING,
+    )
+    out = realized[0]
+    assert out["final_response"] == rewritten
+    assert out["messages"][-1] == {"role": "assistant", "content": rewritten, "loss": True}
+    # everything the teacher may not touch survived byte-identical
+    assert out["messages"][:-1] == record["messages"][:-1]
+    assert out["expected_tool_calls"] == record["expected_tool_calls"]
+    assert out["text"] == record["text"]
+    assert out["provenance"]["teacher_model"] == "stub"
+
+
+def test_conversation_import_rejects_a_teacher_file_pinned_before_an_action_turn_moved(
+    tmp_path: Path,
+) -> None:
+    """The tool call and its result are hash-pinned: a request exported before
+    an action turn changed cannot be applied afterwards."""
+    record = _conversation_record()
+    requests_path = tmp_path / "req.jsonl"
+    responses_path = tmp_path / "resp.jsonl"
+    export_teacher_requests(
+        [record], requests_path, editable_fields=["final_response"], **CONVERSATION_WIRING
+    )
+    _respond(requests_path, responses_path, {"final_response": "All set."})
+
+    moved = _conversation_record(
+        action_turns=[
+            {
+                "name": "replace_card",
+                "arguments": {"last4": "1792"},
+                "result": {"ok": True, "result": {"status": "ordered"}},
+            }
+        ]
+    )
+    with pytest.raises(TeacherRealizationError, match="hash mismatch"):
+        import_teacher_responses(
+            [moved],
+            responses_path,
+            editable_fields=["final_response"],
+            teacher_model="stub",
+            teacher_prompt_hash="sha256:x",
+            **CONVERSATION_WIRING,
+        )
+
+
+def test_conversation_import_ignores_action_turns_smuggled_into_the_response(
+    tmp_path: Path,
+) -> None:
+    record = _conversation_record()
+    requests_path = tmp_path / "req.jsonl"
+    responses_path = tmp_path / "resp.jsonl"
+    export_teacher_requests(
+        [record], requests_path, editable_fields=["final_response"], **CONVERSATION_WIRING
+    )
+    _respond(
+        requests_path,
+        responses_path,
+        {
+            "final_response": "All set.",
+            "action_turns": [{"name": "replace_card", "arguments": {}, "result": {"ok": True}}],
+            "expected_tool_calls": [{"name": "replace_card", "arguments": {}}],
+        },
+    )
+    realized = import_teacher_responses(
+        [record],
+        responses_path,
+        editable_fields=["final_response"],
+        teacher_model="stub",
+        teacher_prompt_hash="sha256:x",
+        **CONVERSATION_WIRING,
+    )
+    out = realized[0]
+    assert out["action_turns"] == record["action_turns"]
+    assert out["expected_tool_calls"] == [{"name": "freeze_card", "arguments": {"last4": "1792"}}]
+    called = [message for message in out["messages"] if message.get("tool_calls")]
+    assert [call["tool_calls"][0]["function"]["name"] for call in called] == ["freeze_card"]
+
+
+def test_conversation_noop_rederive_leaves_messages_stale_and_validate_catches_it(
+    tmp_path: Path,
+) -> None:
+    record = _conversation_record()
+    requests_path = tmp_path / "req.jsonl"
+    responses_path = tmp_path / "resp.jsonl"
+    export_teacher_requests(
+        [record], requests_path, editable_fields=["final_response"], **CONVERSATION_WIRING
+    )
+    _respond(requests_path, responses_path, {"final_response": "A different closing line."})
+
+    with pytest.raises(TeacherRealizationError, match="failed post-application validation"):
+        import_teacher_responses(
+            [record],
+            responses_path,
+            editable_fields=["final_response"],
+            teacher_model="stub",
+            teacher_prompt_hash="sha256:x",
+            derived_fields=CONVERSATION_DERIVED_FIELDS,
+            rederive=lambda row: None,
+            validate=validate_conversation_row,
+        )
+
+
+def test_conversation_wiring_requires_an_explicit_validate(tmp_path: Path) -> None:
+    """CONVERSATION_DERIVED_FIELDS is not the default map, so `_AUTO_VALIDATE`
+    resolves to None (identity check) and the caller must pass a validate."""
+    record = _conversation_record()
+    with pytest.raises(TeacherRealizationError, match="validate"):
+        export_teacher_requests(
+            [record],
+            tmp_path / "req.jsonl",
+            editable_fields=["final_response"],
+            derived_fields=CONVERSATION_DERIVED_FIELDS,
+            rederive=rederive_conversation,
+        )
+
+
+def test_conversation_final_response_projection_excludes_exactly_final_and_messages(
+    tmp_path: Path,
+) -> None:
+    editable = ["final_response"]
+    base = _conversation_record()
+    baseline = _exported_hash(base, editable, tmp_path / "base.jsonl")
+
+    other_final = _conversation_record(final_response="Frozen. Nothing new can be charged.")
+    assert other_final["messages"] != base["messages"]
+    assert _exported_hash(other_final, editable, tmp_path / "final.jsonl") == baseline
+
+    messages_only = _conversation_record()
+    messages_only["messages"] = []
+    assert _exported_hash(messages_only, editable, tmp_path / "msgs.jsonl") == baseline
+
+    for field, value in (
+        ("text", "[CURRENT_USER]\nsomething else"),
+        ("user_text", "freeze the card"),
+        ("expected_tool_calls", []),
+        ("action_turns", []),
+        ("context_messages", []),
+        ("has_context", False),
+        ("group_id", "c2"),
+    ):
+        mutated = _conversation_record()
+        mutated[field] = value
+        message = f"{field} must be covered by the immutable hash"
+        assert _exported_hash(mutated, editable, tmp_path / f"{field}.jsonl") != baseline, message
+
+
+def test_conversation_user_text_projection_also_excludes_text(tmp_path: Path) -> None:
+    editable = ["user_text", "final_response"]
+    base = _conversation_record()
+    baseline = _exported_hash(base, editable, tmp_path / "base.jsonl")
+
+    other_user = _conversation_record(user_text="freeze the card please")
+    assert other_user["text"] != base["text"]
+    assert _exported_hash(other_user, editable, tmp_path / "user.jsonl") == baseline
+
+    text_only = _conversation_record()
+    text_only["text"] = "[CURRENT_USER]\nsomething else"
+    assert _exported_hash(text_only, editable, tmp_path / "text.jsonl") == baseline
+
+    calls_only = _conversation_record()
+    calls_only["expected_tool_calls"] = []
+    assert _exported_hash(calls_only, editable, tmp_path / "calls.jsonl") != baseline
