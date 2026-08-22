@@ -97,9 +97,11 @@ observe a within-split `text` duplicate -- it was already dropped. That is what
 rows and **fail fast**, raising `ValueError("pre-dedup check failed: ...")`, so
 a post-teacher report rebuild needs no re-injection and `write_dataset` can
 never see a build they rejected. Their keys are still merged into
-`report["leakage"]` for the record. `compose` also reports
-`within_split_duplicates_removed` as a sub-count of the unchanged
-`cross_split_duplicates_removed`; neither gates.
+`report["leakage"]` for the record -- and because a rebuilt report cannot
+recompute a pre-dedup finding, `build_report(extra_leakage=...)` is how a caller
+carries those keys into the report it actually emits, so the manifest records
+that the gate ran. `compose` also reports `within_split_duplicates_removed` as a
+sub-count of the unchanged `cross_split_duplicates_removed`; neither gates.
 
 ### Teacher provenance: outside the hash, stamped, and pinned to a prompt
 
@@ -180,7 +182,12 @@ derived-field map is non-default, so the library cannot infer them.
 Note that `text` renders context and user turns only, never tool calls: two
 rows sharing a context and a user turn but calling different tools render the
 same `text`, which is why the example dedups on `user_text` through
-`pre_dedup_checks` rather than leaning on `text`.
+`pre_dedup_checks` rather than leaning on `text`. One more knob a conversation
+build must set: `compose`/`build_report` default `secondary_leak_fields` to
+`("current_text",)`, which is the classifier row's field, and
+`secondary_field_leaks` now raises on a field absent from every row -- so pass
+`secondary_leak_fields=("user_text",)` (as the example does) rather than
+letting the default fail the build.
 
 ## Quickstart
 

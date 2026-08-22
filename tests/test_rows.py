@@ -271,11 +271,12 @@ def _conversation_row(**overrides: object) -> dict:
     return make_conversation_row(**kwargs)
 
 
-def test_conversation_derived_fields_declares_the_three_derived_fields() -> None:
+def test_conversation_derived_fields_declares_every_field_rederive_recomputes() -> None:
     assert CONVERSATION_DERIVED_FIELDS == {
         "messages": ("context_messages", "user_text", "action_turns", "final_response"),
         "text": ("context_messages", "user_text"),
         "expected_tool_calls": ("action_turns",),
+        "has_context": ("context_messages",),
     }
 
 

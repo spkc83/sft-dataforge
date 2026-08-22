@@ -236,6 +236,53 @@ def test_extra_leak_checks_reject_colliding_keys() -> None:
         )
 
 
+def test_extra_leakage_merges_precomputed_findings_into_the_report() -> None:
+    """The rebuild path for findings build_report cannot recompute.
+
+    ``compose``'s pre-dedup checks see the rows before deduplication; a report
+    rebuilt on the deduplicated (or post-teacher) splits can only be handed
+    their result.
+    """
+    report = build_report(
+        {"train": [_row("a", "g1")], "validation": [], "test": []},
+        extra_leakage={"user_text_duplicate_leaks": [], "user_text_duplicate_leak_count": 0},
+    )
+    assert report["leakage"]["user_text_duplicate_leak_count"] == 0
+    assert report["leakage"]["user_text_duplicate_leaks"] == []
+
+
+def test_extra_leakage_rejects_keys_colliding_with_the_built_in_leakage_keys() -> None:
+    with pytest.raises(ValueError, match="colliding"):
+        build_report(
+            {"train": [_row("a", "g1")], "validation": [], "test": []},
+            extra_leakage={"group_split_leak_count": 999},
+        )
+
+
+def test_extra_leakage_rejects_keys_colliding_with_an_extra_leak_check() -> None:
+    def custom_check(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping[str, Any]:
+        return {"custom_leak_count": 0}
+
+    with pytest.raises(ValueError, match="colliding"):
+        build_report(
+            {"train": [_row("a", "g1")], "validation": [], "test": []},
+            extra_leak_checks=[custom_check],
+            extra_leakage={"custom_leak_count": 0},
+        )
+
+
+def test_extra_leakage_still_gates_a_nonzero_value_it_carries_forward() -> None:
+    """A carried-forward finding is not a footnote: it gates like any other."""
+    from dataforge.emit import default_gates
+
+    report = build_report(
+        {"train": [_row("a", "g1")], "validation": [], "test": []},
+        extra_leakage={"user_text_duplicate_leak_count": 1},
+    )
+    with pytest.raises(ValueError, match="user_text_duplicate_leak_count"):
+        default_gates(report)
+
+
 def test_pii_fields_none_scans_every_string_field() -> None:
     registry = Registry()
 

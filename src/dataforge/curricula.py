@@ -189,6 +189,7 @@ def build_report(
     secondary_leak_min_tokens: int = 3,
     secondary_leak_row_predicate: Callable[[Mapping[str, Any]], bool] | None = None,
     extra_leak_checks: Sequence[LeakCheck] = (),
+    extra_leakage: Mapping[str, Any] | None = None,
     pii_fields: Sequence[str] | None = None,
     cross_split_duplicates_removed: int = 0,
     within_split_duplicates_removed: int = 0,
@@ -233,6 +234,17 @@ def build_report(
     :func:`dataforge.emit.default_gates`. Raises if a check's keys collide
     with the built-in leakage keys or with another check's keys.
 
+    ``extra_leakage``: already-computed findings to merge into
+    ``report["leakage"]``, under the same collision rule. It exists for results
+    this function *cannot* recompute -- specifically :func:`compose`'s
+    ``pre_dedup_checks``, which see the rows before deduplication and so can
+    never be reproduced from the deduplicated (let alone post-teacher) splits.
+    Without it a rebuilt report silently drops them and the emitted manifest
+    cannot distinguish "the pre-dedup gate ran and passed" from "it was never
+    wired". Pass the relevant keys straight from ``compose``'s report. They
+    gate exactly like any other leakage key, so carrying a nonzero value
+    forward will (correctly) fail the release.
+
     ``cross_split_duplicates_removed``/``within_split_duplicates_removed`` are
     reported verbatim (``build_report`` cannot recompute them -- only
     :func:`compose` sees the pre-dedup rows). The first counts every row dedup
@@ -263,6 +275,8 @@ def build_report(
     )
     for check in extra_leak_checks:
         _merge_leakage(leakage, check(splits), source="extra_leak_checks")
+    if extra_leakage is not None:
+        _merge_leakage(leakage, extra_leakage, source="extra_leakage")
 
     if pii_fields is None:
         pii_texts: Iterable[str] = (

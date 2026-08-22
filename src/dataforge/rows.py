@@ -23,16 +23,24 @@ DERIVED_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 #: The same contract for :func:`make_conversation_row` rows: the rendered
-#: transcript, its flattened `text`, and the `expected_tool_calls` projection
-#: are all derived from the four source fields. Pass this as `derived_fields`
-#: (with `rederive=rederive_conversation` and
+#: transcript, its flattened `text`, the `expected_tool_calls` projection and
+#: the `has_context` flag are all derived from the four source fields. Pass
+#: this as `derived_fields` (with `rederive=rederive_conversation` and
 #: `validate=validate_conversation_row`) to the :mod:`dataforge.teacher` entry
 #: points -- it is deliberately *not* the default map, so a caller who edits a
 #: conversation row's text must say so explicitly.
+#:
+#: `has_context` is declared even though no teacher projection can currently
+#: affect it (it depends only on `context_messages`, which is never editable):
+#: `rederive_conversation` recomputes it and `validate_conversation_row` checks
+#: it, so leaving it out of the map would mean a caller who *did* make
+#: `context_messages` editable got a "changed immutable semantics" rejection
+#: for a field their `rederive` had correctly updated.
 CONVERSATION_DERIVED_FIELDS: dict[str, tuple[str, ...]] = {
     "messages": ("context_messages", "user_text", "action_turns", "final_response"),
     "text": ("context_messages", "user_text"),
     "expected_tool_calls": ("action_turns",),
+    "has_context": ("context_messages",),
 }
 
 

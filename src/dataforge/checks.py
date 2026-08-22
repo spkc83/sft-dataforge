@@ -354,9 +354,18 @@ def _text(row: Mapping[str, Any], field: str) -> str | None:
 def hash_pinned() -> Rule:
     """The response must echo the request's ``immutable_hash``, well formed.
 
-    This is the checker-side mirror of ``import_teacher_responses``' pre-hash
-    check: catching a moved hash here reports every affected row at once,
-    where the importer would raise on the first.
+    This compares the two **wire rows** -- ``request["immutable_hash"]`` against
+    ``response["immutable_hash"]`` -- and reads nothing else; ``pair.record`` is
+    never touched. It catches a teacher that dropped, mangled or rewrote the
+    hash it was handed, and reports every such row at once where the importer
+    would raise on the first.
+
+    It deliberately does **not** compare either hash against the record's live
+    one. That check belongs to :func:`dataforge.teacher.import_teacher_responses`
+    and only it can make it, because a record's hash may legitimately have moved
+    since export -- a :func:`dataforge.teacher.scrub_fields` pass, accepted at
+    import through ``accept_pre_scrub_hashes`` -- without either wire row being
+    wrong. A rule here could not tell that case from a real drift.
 
     Presence and shape are checked before equality, because a teacher that
     dropped the field entirely would otherwise compare equal to a request that
@@ -576,6 +585,14 @@ def unique_normalized(
     from ``record["source_split"]`` when ``split_of`` is not given. The caller's
     records are never mutated. Members are ordered rewrites first (batch order)
     then untouched records (record order).
+
+    **That default is a different source from
+    :func:`dataforge.guards.duplicate_text_leaks`'**, which stamps the split key
+    it iterated -- the split a row was actually placed under. This rule has no
+    split map to iterate and can only ask the record. The two agree exactly
+    while every row's ``source_split`` matches where the build put it; pass
+    ``split_of=`` whenever they can diverge, or the same exemption predicate
+    will answer differently at the two layers.
 
     Pass ``set_value`` whenever ``record_value`` is not a plain lookup of
     ``field`` -- it is ``record_value``'s inverse, and the exemption predicate
