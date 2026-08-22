@@ -323,3 +323,151 @@ def test_build_report_contract_and_fingerprint() -> None:
     # mutating a row's content changes the fingerprint
     splits["train"][0]["text"] = "a changed"
     assert build_report(splits)["splits_fingerprint"] != report["splits_fingerprint"]
+
+
+def test_within_split_duplicates_are_reported_separately_from_the_lumped_total() -> None:
+    """N5: `cross_split_duplicates_removed` keeps its historical meaning (both
+    kinds of removal); the new `within_split_duplicates_removed` is a sub-count
+    of it, not a replacement."""
+    registry = Registry()
+
+    @registry.register("dupes", splits=("train", "test"))
+    def dupes(split: str) -> list[dict]:
+        if split == "train":
+            return [
+                _row("train only duplicate", "g-a"),
+                _row("train only duplicate", "g-b"),
+                _row("shared across splits", "g-c"),
+            ]
+        return [_row("shared across splits", "g-d")]
+
+    splits, report = compose({"train": [], "validation": [], "test": []}, registry)
+    assert len(splits["train"]) == 1
+    assert len(splits["test"]) == 1
+    assert report["cross_split_duplicates_removed"] == 2  # unchanged: both kinds
+    assert report["within_split_duplicates_removed"] == 1
+
+
+def test_build_report_defaults_within_split_duplicates_removed_to_zero() -> None:
+    report = build_report({"train": [_row("a", "g1")]})
+    assert report["within_split_duplicates_removed"] == 0
+
+
+def test_pre_dedup_checks_run_before_dedup_can_hide_a_within_split_duplicate() -> None:
+    """The vacuity fix: `compose` dedups on `text` before `build_report`, so a
+    report-time check can never see a within-split `text` duplicate. A
+    pre-dedup check can."""
+    registry = Registry()
+
+    @registry.register("dupes", splits=("train",))
+    def dupes(split: str) -> list[dict]:
+        return [_row("the very same text", "g1"), _row("the very same text", "g2")]
+
+    seen: list[int] = []
+
+    def counting_check(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping[str, Any]:
+        seen.append(sum(len(rows) for rows in splits.values()))
+        return {"prededup_rowcount_leaks": [], "prededup_rowcount_leak_count": 0}
+
+    splits, report = compose(
+        {"train": [], "validation": [], "test": []},
+        registry,
+        pre_dedup_checks=[counting_check],
+    )
+    assert seen == [2]  # both rows were visible to the check
+    assert len(splits["train"]) == 1  # only one survived dedup
+    assert report["leakage"]["prededup_rowcount_leak_count"] == 0
+
+
+def test_pre_dedup_checks_fail_the_build_fast_with_their_findings() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train",))
+    def r(split: str) -> list[dict]:
+        return [_row("a", "g1")]
+
+    def failing_check(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping[str, Any]:
+        return {
+            "user_text_duplicate_leaks": [{"normalized": "a", "members": []}],
+            "user_text_duplicate_leak_count": 1,
+        }
+
+    with pytest.raises(ValueError, match="^pre-dedup check failed:"):
+        compose(
+            {"train": [], "validation": [], "test": []},
+            registry,
+            pre_dedup_checks=[failing_check],
+        )
+
+
+def test_pre_dedup_checks_fail_on_a_non_empty_leaks_list_with_no_count_key() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train",))
+    def r(split: str) -> list[dict]:
+        return [_row("a", "g1")]
+
+    def failing_check(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping[str, Any]:
+        return {"wording_leaks": [{"split": "train"}]}
+
+    with pytest.raises(ValueError, match="wording_leaks"):
+        compose(
+            {"train": [], "validation": [], "test": []},
+            registry,
+            pre_dedup_checks=[failing_check],
+        )
+
+
+def test_pre_dedup_check_keys_are_carried_into_the_final_report_leakage() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train",))
+    def r(split: str) -> list[dict]:
+        return [_row("a", "g1")]
+
+    def clean_check(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping[str, Any]:
+        return {"wording_leaks": [], "wording_leak_count": 0}
+
+    _, report = compose(
+        {"train": [], "validation": [], "test": []},
+        registry,
+        pre_dedup_checks=[clean_check],
+    )
+    assert report["leakage"]["wording_leak_count"] == 0
+    assert report["leakage"]["wording_leaks"] == []
+
+
+def test_pre_dedup_checks_reject_keys_colliding_with_the_built_in_leakage_keys() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train",))
+    def r(split: str) -> list[dict]:
+        return [_row("a", "g1")]
+
+    def colliding_check(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping[str, Any]:
+        return {"group_split_leak_count": 0}
+
+    with pytest.raises(ValueError, match="colliding"):
+        compose(
+            {"train": [], "validation": [], "test": []},
+            registry,
+            pre_dedup_checks=[colliding_check],
+        )
+
+
+def test_two_pre_dedup_checks_reject_colliding_keys_with_each_other() -> None:
+    registry = Registry()
+
+    @registry.register("r", splits=("train",))
+    def r(split: str) -> list[dict]:
+        return [_row("a", "g1")]
+
+    def check(splits: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping[str, Any]:
+        return {"wording_leak_count": 0}
+
+    with pytest.raises(ValueError, match="colliding"):
+        compose(
+            {"train": [], "validation": [], "test": []},
+            registry,
+            pre_dedup_checks=[check, check],
+        )

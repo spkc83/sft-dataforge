@@ -7,6 +7,7 @@ from dataforge.rows import (
     canonical_json_bytes,
     make_row,
     normalize_text,
+    normalize_text_ascii,
     rederive_text,
     render_context,
     validate_row_consistency,
@@ -190,3 +191,19 @@ def test_validate_row_consistency_rejects_stale_text() -> None:
     row["current_text"] = "a completely different question"  # text not re-rendered
     with pytest.raises(ValueError, match="inconsistent"):
         validate_row_consistency(row)
+
+
+def test_normalize_text_ascii_collapses_punctuation_and_whitespace() -> None:
+    assert normalize_text_ascii("  Freeze  my CARD, please!  ") == "freeze my card please"
+
+
+def test_normalize_text_ascii_drops_non_ascii_letters_unlike_normalize_text() -> None:
+    """`normalize_text_ascii` is the v9 predicate: `[^a-z0-9]+` -> space, so a
+    non-ASCII letter is punctuation to it, while `normalize_text`'s Unicode
+    `str.isalnum()` keeps it. The divergence is deliberate and documented."""
+    assert normalize_text_ascii("Café Münster") == "caf m nster"
+    assert normalize_text("Café Münster") == "café münster"
+
+
+def test_normalize_text_ascii_of_blank_text_is_empty() -> None:
+    assert normalize_text_ascii("   ...   ") == ""
