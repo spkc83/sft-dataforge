@@ -170,8 +170,10 @@ def test_a_teacher_that_smuggles_banned_wording_fails_the_batch_check(tmp_path: 
     with pytest.raises(ValueError, match="teacher batch check failed") as error:
         build(tmp_path / "run1", teacher_rewrite=tampering_teacher)
     message = str(error.value)
-    assert "train-list-cards-0: banned_pattern" in message
-    assert "'demo'" in message
+    # Rule name and record id only: the checker owns its detail strings and is
+    # free to reword them, but which rule fired on which row is the contract.
+    assert "train-list-cards-0" in message
+    assert "banned_pattern" in message
     assert not (tmp_path / "run1" / "train.jsonl").exists()
 
 

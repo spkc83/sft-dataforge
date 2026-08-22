@@ -52,7 +52,12 @@ from dataforge.emit import (
     write_dataset,
     write_source_lock,
 )
-from dataforge.guards import count_pii_matches, heldout_leaks, leakage_report
+from dataforge.guards import (
+    count_pii_matches,
+    heldout_leaks,
+    leakage_report,
+    paired_counterfactual_exemption,
+)
 from dataforge.rows import (
     CONVERSATION_DERIVED_FIELDS,
     DERIVED_FIELDS,
@@ -122,6 +127,7 @@ __all__ = [
     "normalize_text",
     "normalize_text_ascii",
     "opening_ngram_cap",
+    "paired_counterfactual_exemption",
     "preserved_literals",
     "rederive_conversation",
     "rederive_text",
