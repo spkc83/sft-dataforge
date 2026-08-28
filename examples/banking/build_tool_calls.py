@@ -8,10 +8,15 @@ This is the second, separate build in the examples package -- conversation rows
 rather than classifier rows -- and it exists to wire the v9 mechanisms end to
 end. The order of the pipeline is the point, so it is worth stating once:
 
-1. ``compose`` runs the curricula, then the **pre-dedup** duplicate-``user_text``
-   check on the raw rows and fails the build if a duplicate is not a governed
-   counterfactual pair. This has to happen before dedup, because dedup on
-   ``text`` would otherwise silently drop the evidence.
+1. ``compose`` runs the curricula, then the **pre-dedup** checks on the raw
+   rows: duplicate ``user_text`` that is not a governed counterfactual pair, a
+   behaviour row that breaks one of its field invariants, a frozen evaluation
+   probe that reached a trainable split, and a final that claims a completed
+   account action the row has no tool evidence for. Any of them fails the build.
+   This has to happen before dedup, because dedup on ``text`` would otherwise
+   silently drop the evidence. The router export is then built through the same
+   checks and audited with ``foreign_use_rows``, so the SFT-only behaviour
+   family staying out of it is a checked property rather than a convention.
 2. Teacher requests are exported over ``final_response`` only, pinning a hash
    of everything else -- context, user turn, tool calls, tool results, labels.
 3. The stub teacher rewrites the finals.
@@ -52,12 +57,18 @@ from dataforge.checks import (
     opening_ngram_cap,
     unique_normalized,
 )
-from dataforge.curricula import build_report, compose
+from dataforge.curricula import build_report, compose, foreign_use_rows
 from dataforge.emit import write_dataset, write_source_lock
 from dataforge.guards import (
+    banned_patterns,
     banned_wording_leaks,
     duplicate_text_leaks,
+    field_invariant_leaks,
+    no_digits,
+    no_questions,
     paired_counterfactual_exemption,
+    probe_exclusion_leaks,
+    unsupported_claim_leaks,
 )
 from dataforge.rows import (
     CONVERSATION_DERIVED_FIELDS,
@@ -73,6 +84,10 @@ from dataforge.teacher import (
 from examples.banking.taxonomy import ACTION_LABELS, ENTITY_RESOLUTION_LABELS, LANE_LABELS
 from examples.banking.tool_curricula import (
     BANNED_WORDING,
+    BEHAVIOUR_CURRICULUM,
+    CURRICULUM_FIELD,
+    EVAL_PROBES,
+    PROBE_FRAGMENTS,
     REGISTRY,
     SCRUB_RECORD_ID,
     SCRUB_SUBSTITUTIONS,
@@ -105,12 +120,49 @@ Splits = Mapping[str, Sequence[Mapping[str, Any]]]
 #: (``history``) is the classifier row's.
 GOVERNED_PAIR_EXEMPTION = paired_counterfactual_exemption(context_fields=("context_messages",))
 
-#: The keys ``_duplicate_user_text_check`` contributes to ``compose``'s report.
-#: Named explicitly so the post-teacher rebuild can carry them into the emitted
+#: The keys the pre-dedup checks contribute to ``compose``'s report. Named
+#: explicitly so the post-teacher rebuild can carry them into the emitted
 #: manifest -- ``build_report`` runs after dedup and could never recompute them
 #: -- and so a check that stopped producing them fails here with a ``KeyError``
 #: rather than quietly dropping out of the governance record.
-PRE_DEDUP_LEAK_KEYS = ("user_text_duplicate_leaks", "user_text_duplicate_leak_count")
+PRE_DEDUP_LEAK_KEYS = (
+    "user_text_duplicate_leaks",
+    "user_text_duplicate_leak_count",
+    "field_invariant_leaks",
+    "probe_exclusion_leaks",
+    "unsupported_claim_leaks",
+)
+
+#: The secondary consumer this dataset's SFT-only families must never reach.
+#: The example asserts it rather than documenting it: see
+#: ``_assert_no_foreign_rows_in_a_router_export``.
+ROUTER_USE = "router"
+
+#: Wording that asserts a completed account action. Checked against every
+#: trainable final, but only as a *claim*: whether it is a lie depends on
+#: whether the row carries tool evidence, which is what
+#: ``unsupported_claim_leaks`` decides.
+COMPLETED_ACTION_CLAIMS: tuple[str, ...] = (
+    r"\bI have (?:frozen|blocked|closed|booked|filed|opened)\b",
+    r"\bI checked\b",
+    r"\bwent through\b",
+)
+
+#: The invariants the hand-authored behaviour rows hold to and the rest of the
+#: corpus does not. A behaviour curriculum teaches a mapping by repeating it, so
+#: every one of its frames has to be right: no invented digits, no question mark
+#: turning the refusal back into a clarification, and no promise to follow up on
+#: something this assistant cannot do. Scoped by ``row_predicate`` -- the
+#: tool-calling rows legitimately quote card digits and legitimately ask which
+#: card to freeze.
+BEHAVIOUR_INVARIANTS = (
+    no_digits(),
+    no_questions(),
+    banned_patterns(
+        (r"\bI will (?:check|look into|get back)\b", r"\b(?:hold on|one moment|bear with me)\b"),
+        label="no_deferred_promise",
+    ),
+)
 
 #: The transcript validator bound to this domain's tool registry, passed to
 #: both teacher entry points so a rewrite that somehow disturbed a tool call
@@ -143,6 +195,55 @@ def _duplicate_user_text_check(splits: Splits) -> Mapping[str, Any]:
     already been dropped and a report-time check would pass vacuously.
     """
     return duplicate_text_leaks(splits, "user_text", exempt=GOVERNED_PAIR_EXEMPTION)
+
+
+def _behaviour_invariant_check(splits: Splits) -> Mapping[str, Any]:
+    """The behaviour curriculum's finals must satisfy every invariant it declares.
+
+    Wired through ``pre_dedup_checks`` for the reason invariants always are: a
+    frame that violates one and happens to collide with a clean sibling would be
+    dropped by dedup before any report-time check could see it, and the build
+    would pass on the strength of the row that survived.
+    """
+    return field_invariant_leaks(
+        splits,
+        field="final_response",
+        invariants=BEHAVIOUR_INVARIANTS,
+        row_predicate=lambda row: row.get(CURRICULUM_FIELD) == BEHAVIOUR_CURRICULUM,
+    )
+
+
+def _probe_exclusion_check(splits: Splits) -> Mapping[str, Any]:
+    """No trainable row may reproduce a frozen evaluation probe.
+
+    ``user_text`` is where a whole probe would land verbatim; ``text`` is the
+    rendered context, which is how a probe phrase sneaks in through an earlier
+    turn rather than the current one. Both are scanned, and the frozen split
+    that owns the probes is exempt by construction.
+    """
+    return probe_exclusion_leaks(
+        splits,
+        probes=EVAL_PROBES,
+        fragments=PROBE_FRAGMENTS,
+        fields=("user_text", "text"),
+        splits_checked=TRAINABLE_SPLITS,
+    )
+
+
+def _unsupported_claim_check(splits: Splits) -> Mapping[str, Any]:
+    """A final may claim a completed action only if the row carries tool turns.
+
+    The evidence is ``action_turns``, the non-editable list the transcript is
+    rendered from -- so "did this row actually do the thing" is answered by the
+    same field the model is trained to produce, not by reading the prose.
+    """
+    return unsupported_claim_leaks(
+        splits,
+        field="final_response",
+        claim_patterns=COMPLETED_ACTION_CLAIMS,
+        evidence_fn=lambda row: bool(row.get("action_turns")),
+        splits_checked=TRAINABLE_SPLITS,
+    )
 
 
 def _duplicate_final_response_check(splits: Splits) -> Mapping[str, Any]:
@@ -185,6 +286,50 @@ CHECKER_RULES = (
 )
 
 
+#: Every check that has to see the rows before deduplication, in the order they
+#: run. Shared with the router build below so both are gated identically.
+PRE_DEDUP_CHECKS = (
+    _duplicate_user_text_check,
+    _behaviour_invariant_check,
+    _probe_exclusion_check,
+    _unsupported_claim_check,
+)
+
+
+def _assert_no_foreign_rows_in_a_router_export(
+    seeds: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> None:
+    """Build the router's view of this dataset and prove it excludes what it must.
+
+    Two halves of one policy. ``compose(use=...)`` is the *construction* side:
+    the registry drops any curriculum whose ``uses`` do not name the router, so
+    the behaviour family never enters the export. ``foreign_use_rows`` is the
+    *audit* side: given rows and the registry that produced them, it names any
+    row a consumer should never have received. Asserting it here is what keeps
+    "the SFT-only family stays out of the router export" a checked property of
+    the build rather than a comment nobody re-reads.
+    """
+    router_splits, _ = compose(
+        seed_splits=seeds,
+        registry=REGISTRY,
+        split_order=SPLIT_ORDER,
+        pre_dedup_checks=PRE_DEDUP_CHECKS,
+        use=ROUTER_USE,
+        **REPORT_KWARGS,
+    )
+    foreign = foreign_use_rows(
+        REGISTRY,
+        [row for rows in router_splits.values() for row in rows],
+        use=ROUTER_USE,
+        name_field=CURRICULUM_FIELD,
+    )
+    if foreign:
+        raise ValueError(
+            f"{ROUTER_USE} export contains rows from curricula that do not permit it: "
+            + ", ".join(sorted(str(row["record_id"]) for row in foreign))
+        )
+
+
 def _stub_teacher_rewrite(record_id: str, final_response: str) -> str:
     """A deterministic stand-in for an LLM teacher: wording only, no new facts.
 
@@ -214,9 +359,10 @@ def build(
         seed_splits=seeds,
         registry=REGISTRY,
         split_order=SPLIT_ORDER,
-        pre_dedup_checks=(_duplicate_user_text_check,),
+        pre_dedup_checks=PRE_DEDUP_CHECKS,
         **REPORT_KWARGS,
     )
+    _assert_no_foreign_rows_in_a_router_export(seeds)
 
     # compose merges its pre-dedup findings into its own report, but
     # build_report cannot recompute them (they are about the rows before

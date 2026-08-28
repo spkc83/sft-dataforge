@@ -13,6 +13,12 @@ domain: a multi-turn row whose context contains its own tool-call pair, a
 governed counterfactual pair that shares one utterance across two different
 decisions, an error envelope, and a frozen test row that deliberately contains
 banned wording.
+
+One curriculum is shaped differently from the rest: ``refusal_honesty`` is a
+hand-authored *behaviour* curriculum built from a single
+:class:`dataforge.curricula.BehaviourSeed` rather than row by row, it holds to
+field invariants the rest of the corpus does not, and it is tagged
+``uses=("sft",)`` so it never reaches a secondary consumer.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from dataforge.curricula import Registry
+from dataforge.curricula import BehaviourSeed, Registry, behaviour_rows
 from dataforge.rows import make_conversation_row, validate_conversation_row
 from examples.banking.taxonomy import TAXONOMY
 
@@ -45,6 +51,28 @@ TOOL_ARGUMENTS: dict[str, frozenset[str]] = {
 SCRUB_RECORD_ID = "train-multiturn-freeze-0"
 SCRUB_SUBSTITUTIONS: tuple[tuple[str, str], ...] = (
     ("while I am checking the mobile app", "while I am going through my accounts"),
+)
+
+#: The field each row carries naming the curriculum that produced it. It is
+#: what :func:`dataforge.curricula.foreign_use_rows` reads when it audits an
+#: export for families that consumer was never allowed to see.
+CURRICULUM_FIELD = "curriculum"
+
+#: The behaviour curriculum's name, split out because both the ``uses`` tag and
+#: the invariant check's row predicate have to agree on it.
+BEHAVIOUR_CURRICULUM = "refusal_honesty"
+
+#: The frozen split's evaluation probes, defined here so the rows below are
+#: built *from* them: a probe list that drifts from the rows it describes gates
+#: nothing. ``PROBE_FRAGMENTS`` are the distinctive phrases a paraphrase of a
+#: probe would still carry.
+EVAL_PROBES: tuple[str, ...] = (
+    "why does my frozen card still have a pending charge on it",
+    "can you freeze both of my cards while i travel next week",
+)
+PROBE_FRAGMENTS: tuple[str, ...] = (
+    "still have a pending charge",
+    "freeze both of my cards",
 )
 
 _ACTIVE_CARDS = {
@@ -80,6 +108,18 @@ def _conversation_row(**kwargs: Any) -> dict[str, Any]:
     row = make_conversation_row(**kwargs)
     validate_conversation_row(row, tool_arguments=TOOL_ARGUMENTS)
     return row
+
+
+def _tagged(name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Stamp each row with the curriculum that produced it.
+
+    Every row, not just the restricted family's: ``foreign_use_rows`` can only
+    judge a row whose curriculum it can name, so a corpus where only the
+    interesting rows are tagged would report clean for the wrong reason.
+    """
+    for row in rows:
+        row[CURRICULUM_FIELD] = name
+    return rows
 
 
 def _freeze_turn(card_id: str) -> dict[str, Any]:
@@ -124,7 +164,7 @@ def _clarify_labels() -> dict[str, Any]:
 def single_turn_tool_rows(split: str) -> list[dict[str, Any]]:
     """One ``freeze_card`` and one ``list_cards`` row per trainable split."""
     if split == "train":
-        return [
+        return _tagged("single_turn_tools", [
             _conversation_row(
                 record_id="train-freeze-execute-0",
                 context_messages=[_system_turn()],
@@ -155,8 +195,8 @@ def single_turn_tool_rows(split: str) -> list[dict[str, Any]]:
                 source_split=split,
                 group_id="tool-list-cards|train|0",
             ),
-        ]
-    return [
+        ])
+    return _tagged("single_turn_tools", [
         _conversation_row(
             record_id="validation-freeze-execute-0",
             context_messages=[_system_turn()],
@@ -187,7 +227,7 @@ def single_turn_tool_rows(split: str) -> list[dict[str, Any]]:
             source_split=split,
             group_id="tool-list-cards|validation|0",
         ),
-    ]
+    ])
 
 
 @REGISTRY.register("multi_turn_freeze", splits=("train",))
@@ -202,7 +242,7 @@ def multi_turn_freeze_rows(split: str) -> list[dict[str, Any]]:
     """
     record_id = SCRUB_RECORD_ID
     context_call_id = f"context_{record_id}_0"
-    return [
+    return _tagged("multi_turn_freeze", [
         _conversation_row(
             record_id=record_id,
             context_messages=[
@@ -257,7 +297,7 @@ def multi_turn_freeze_rows(split: str) -> list[dict[str, Any]]:
             source_split=split,
             group_id="tool-multiturn|train|0",
         )
-    ]
+    ])
 
 
 @REGISTRY.register("counterfactual_pair", splits=("train",))
@@ -272,7 +312,7 @@ def counterfactual_pair_rows(split: str) -> list[dict[str, Any]]:
     differs), so ``compose``'s own dedup keeps both.
     """
     shared_user_text = "freeze it before anyone else uses it"
-    return [
+    return _tagged("counterfactual_pair", [
         _conversation_row(
             record_id="train-pair-execute-0",
             context_messages=[
@@ -333,7 +373,7 @@ def counterfactual_pair_rows(split: str) -> list[dict[str, Any]]:
             pair_target="clarify",
             pair_family="freeze_ambiguity",
         ),
-    ]
+    ])
 
 
 @REGISTRY.register("tool_error_envelope", splits=("validation",))
@@ -343,7 +383,7 @@ def tool_error_envelope_rows(split: str) -> list[dict[str, Any]]:
     The envelope is part of the hashed, non-editable surface, so the teacher
     can rephrase the apology but cannot promote a failure into a success.
     """
-    return [
+    return _tagged("tool_error_envelope", [
         _conversation_row(
             record_id="validation-freeze-error-0",
             context_messages=[_system_turn()],
@@ -371,7 +411,7 @@ def tool_error_envelope_rows(split: str) -> list[dict[str, Any]]:
             source_split=split,
             group_id="tool-freeze-error|validation|0",
         )
-    ]
+    ])
 
 
 @REGISTRY.register("frozen_regression", splits=("test",))
@@ -382,12 +422,17 @@ def frozen_regression_rows(split: str) -> list[dict[str, Any]]:
     the model must never be *trained* to produce, which is precisely why the
     regression that watches for it has to be allowed to say it. It stays legal
     because ``banned_wording_leaks`` only scans trainable splits.
+
+    Both user turns come from :data:`EVAL_PROBES`, which is also what
+    ``probe_exclusion_leaks`` is given: the probes and the rows that carry them
+    are one definition, so the gate cannot drift into checking for text no
+    evaluation actually uses.
     """
-    return [
+    return _tagged("frozen_regression", [
         _conversation_row(
             record_id="test-frozen-pending-0",
             context_messages=[_system_turn()],
-            user_text="why does my frozen card still have a pending charge on it",
+            user_text=EVAL_PROBES[0],
             action_turns=[_list_turn("frozen")],
             final_response=(
                 "That charge was authorized before the freeze, so it is still shown in the "
@@ -402,7 +447,7 @@ def frozen_regression_rows(split: str) -> list[dict[str, Any]]:
         _conversation_row(
             record_id="test-freeze-both-0",
             context_messages=[_system_turn()],
-            user_text="can you freeze both of my cards while i travel next week",
+            user_text=EVAL_PROBES[1],
             action_turns=[_freeze_turn("card-4821"), _freeze_turn("card-7715")],
             final_response=(
                 "Both cards are frozen for your trip: the travel debit ending in 4821 and the "
@@ -414,4 +459,80 @@ def frozen_regression_rows(split: str) -> list[dict[str, Any]]:
             source_split=split,
             group_id="tool-freeze-both|test|0",
         ),
-    ]
+    ])
+
+
+#: The behaviour this curriculum exists to install, written once: when the
+#: assistant cannot do a thing, it says so plainly, does not defer, and does not
+#: leave the customer believing something is in motion. One mapping, three
+#: surface frames, and a subject held back from train so the validation split
+#: measures generalization rather than recall.
+REFUSAL_HONESTY_SEED = BehaviourSeed(
+    key="unsupported_capability",
+    family="refusal_honesty",
+    frames=(
+        "can you {s} for me",
+        "i need you to {s} before the end of the day",
+        "would you be able to {s} from this chat",
+    ),
+    finals=(
+        "I cannot {s} from this line, and I would rather tell you that plainly than leave you "
+        "waiting on something that will not happen.",
+        "I am not able to {s}, so nothing has been started on your behalf; the servicing team on "
+        "the phone can take that on with you.",
+        "A request to {s} is outside what I can reach here, and I have not worked around that or "
+        "passed it along quietly.",
+    ),
+    subjects={
+        "train": ("book a flight with card points", "file a tax return"),
+        "validation": ("open a brokerage position",),
+    },
+    tags=(("behaviour", "refusal_honesty"),),
+)
+
+
+def _refusal_honesty_row(
+    *,
+    seed: BehaviourSeed,
+    split: str,
+    subject: str,
+    frame_index: int,
+    variant: int,
+    text: str,
+    final: str,
+) -> dict[str, Any]:
+    """Turn one (subject, frame) of a behaviour seed into this example's row shape.
+
+    ``behaviour_rows`` knows nothing about conversation rows, taxonomies or
+    record ids; everything schema-shaped is decided here, which is what lets one
+    seed serve a classifier build and a tool-calling build unchanged.
+    """
+    return _conversation_row(
+        record_id=f"{split}-refusal-honesty-{variant}",
+        context_messages=[_system_turn()],
+        user_text=text,
+        action_turns=[],
+        final_response=final,
+        labels=_labels(intent=None),
+        example_kind=seed.family,
+        source="synthetic-behaviour-refusal",
+        source_split=split,
+        group_id=f"behaviour-{seed.key}|{split}|{variant}",
+        extra=dict(seed.tags),
+    )
+
+
+@REGISTRY.register(BEHAVIOUR_CURRICULUM, splits=("train", "validation"), uses=("sft",))
+def refusal_honesty_rows(split: str) -> list[dict[str, Any]]:
+    """The hand-authored behaviour curriculum, expanded from one seed.
+
+    ``uses=("sft",)`` is the point of the tag: these rows are written to move a
+    fine-tuned model's weights, and a downstream consumer that only routes
+    utterances would learn the wrong distribution from them. Declaring that here
+    means a filtered build drops them by construction and
+    ``foreign_use_rows`` can prove an export that was built elsewhere is clean.
+    """
+    return _tagged(
+        BEHAVIOUR_CURRICULUM,
+        behaviour_rows([REFUSAL_HONESTY_SEED], split, row_fn=_refusal_honesty_row),
+    )
