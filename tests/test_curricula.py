@@ -5,7 +5,15 @@ from typing import Any
 
 import pytest
 
-from dataforge.curricula import DEFAULT_DEDUP_PRIORITY, Registry, build_report, compose
+from dataforge.curricula import (
+    DEFAULT_DEDUP_PRIORITY,
+    BehaviourSeed,
+    Registry,
+    behaviour_rows,
+    build_report,
+    compose,
+    foreign_use_rows,
+)
 
 
 def _row(
@@ -518,3 +526,201 @@ def test_two_pre_dedup_checks_reject_colliding_keys_with_each_other() -> None:
             registry,
             pre_dedup_checks=[check, check],
         )
+
+
+def _seed(**overrides: Any) -> BehaviourSeed:
+    defaults: dict[str, Any] = {
+        "key": "unsupported_capability",
+        "family": "refusal_honesty",
+        "frames": ("can you {s} for me", "i need you to {s} today", "could you {s} from here"),
+        "finals": ("I cannot {s}.", "That is outside what I can do, so I did not {s}.", "No: {s}."),
+        "subjects": {
+            "train": ("book a flight", "file a tax return"),
+            "validation": ("buy shares",),
+        },
+    }
+    defaults.update(overrides)
+    return BehaviourSeed(**defaults)
+
+
+def _behaviour_row(**kwargs: Any) -> dict[str, Any]:
+    return {
+        "text": kwargs["text"],
+        "final_response": kwargs["final"],
+        "group_id": f"{kwargs['seed'].key}|{kwargs['split']}|{kwargs['variant']}",
+        "example_kind": kwargs["seed"].family,
+    }
+
+
+def test_behaviour_rows_gives_train_every_frame_and_other_splits_the_first_two() -> None:
+    """Repetition across frames is what reaches the weights; an eval split only
+    needs enough frames to tell whether the behaviour generalized."""
+    seed = _seed()
+    train = behaviour_rows([seed], "train", row_fn=_behaviour_row)
+    validation = behaviour_rows([seed], "validation", row_fn=_behaviour_row)
+    assert len(train) == 6  # 3 frames x 2 subjects
+    assert len(validation) == 2  # 2 frames x 1 held-back subject
+
+
+def test_behaviour_rows_frames_per_validation_subject_is_configurable() -> None:
+    seed = _seed()
+    assert len(behaviour_rows([seed], "validation", row_fn=_behaviour_row,
+                              frames_per_validation_subject=3)) == 3
+    # asking for more frames than the seed has yields every frame, not an error
+    assert len(behaviour_rows([seed], "validation", row_fn=_behaviour_row,
+                              frames_per_validation_subject=9)) == 3
+
+
+def test_behaviour_rows_substitutes_the_subject_into_the_frame_and_the_final() -> None:
+    rows = behaviour_rows([_seed()], "validation", row_fn=_behaviour_row)
+    assert rows[0]["text"] == "can you buy shares for me"
+    assert rows[0]["final_response"] == "I cannot buy shares."
+
+
+def test_behaviour_rows_passes_row_fn_the_full_construction_context() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def recording_row_fn(**kwargs: Any) -> dict[str, Any]:
+        seen.append(kwargs)
+        return {"text": kwargs["text"]}
+
+    seed = _seed()
+    behaviour_rows([seed], "train", row_fn=recording_row_fn)
+    assert [call["variant"] for call in seen] == [0, 1, 2, 3, 4, 5]
+    assert [call["frame_index"] for call in seen] == [0, 1, 2, 0, 1, 2]
+    assert [call["subject"] for call in seen] == ["book a flight"] * 3 + ["file a tax return"] * 3
+    assert {call["split"] for call in seen} == {"train"}
+    assert {id(call["seed"]) for call in seen} == {id(seed)}
+    assert seen[0]["text"] == "can you book a flight for me"
+    assert seen[0]["final"] == "I cannot book a flight."
+
+
+def test_behaviour_rows_counts_variants_per_seed_not_per_call() -> None:
+    seeds = [_seed(), _seed(key="other")]
+    seen: list[int] = []
+
+    def recording_row_fn(**kwargs: Any) -> dict[str, Any]:
+        seen.append(kwargs["variant"])
+        return {}
+
+    behaviour_rows(seeds, "validation", row_fn=recording_row_fn)
+    assert seen == [0, 1, 0, 1]
+
+
+def test_behaviour_rows_rejects_a_subject_used_in_both_train_and_a_held_back_split() -> None:
+    seed = _seed(subjects={"train": ("book a flight",), "validation": ("book a flight",)})
+    with pytest.raises(ValueError, match="generalization signal"):
+        behaviour_rows([seed], "train", row_fn=_behaviour_row)
+
+
+def test_behaviour_rows_rejects_frames_and_finals_of_different_lengths() -> None:
+    seed = _seed(finals=("I cannot {s}.",))
+    with pytest.raises(ValueError, match="3 frames but 1 finals"):
+        behaviour_rows([seed], "train", row_fn=_behaviour_row)
+
+
+def test_behaviour_rows_rejects_a_frame_without_a_subject_placeholder() -> None:
+    seed = _seed(frames=("can you {s} for me", "i need help today", "could you {s} from here"))
+    with pytest.raises(ValueError, match="frame 1 has no"):
+        behaviour_rows([seed], "train", row_fn=_behaviour_row)
+
+
+def test_behaviour_rows_rejects_two_seeds_sharing_a_family_and_key() -> None:
+    with pytest.raises(ValueError, match="share \\(family, key\\)"):
+        behaviour_rows([_seed(), _seed()], "train", row_fn=_behaviour_row)
+
+
+def test_behaviour_rows_rejects_a_seed_with_no_subjects_for_the_split() -> None:
+    with pytest.raises(ValueError, match="no subjects for split 'test'"):
+        behaviour_rows([_seed()], "test", row_fn=_behaviour_row)
+
+
+def test_behaviour_rows_rejects_an_empty_frame_list() -> None:
+    with pytest.raises(ValueError, match="frames must not be empty"):
+        behaviour_rows([_seed(frames=(), finals=())], "train", row_fn=_behaviour_row)
+
+
+def test_behaviour_rows_tags_travel_with_the_seed_for_a_row_fn_to_copy() -> None:
+    seed = _seed(tags=(("behaviour", "refusal_honesty"),))
+    seen: list[dict[str, Any]] = []
+
+    def recording_row_fn(**kwargs: Any) -> dict[str, Any]:
+        seen.append(dict(kwargs["seed"].tags))
+        return {}
+
+    behaviour_rows([seed], "validation", row_fn=recording_row_fn)
+    assert seen[0] == {"behaviour": "refusal_honesty"}
+
+
+def _named_row(text: str, group_id: str, curriculum: str) -> dict:
+    """A row carrying the name of the curriculum that produced it, which is
+    what ``foreign_use_rows`` reads."""
+    row = _row(text, group_id)
+    row["curriculum"] = curriculum
+    return row
+
+
+def _use_registry() -> Registry:
+    registry = Registry()
+
+    @registry.register("shared", splits=("train", "validation"))
+    def shared(split: str) -> list[dict]:
+        return [_named_row(f"shared text for {split}", f"shared|{split}", "shared")]
+
+    @registry.register("sft_only", splits=("train", "validation"), uses=("sft",))
+    def sft_only(split: str) -> list[dict]:
+        return [_named_row(f"sft only text for {split}", f"sft|{split}", "sft_only")]
+
+    return registry
+
+
+def test_build_without_a_use_is_unchanged_and_includes_every_curriculum() -> None:
+    registry = _use_registry()
+    assert len(registry.build("train")) == 2
+    assert len(registry.build("train", use=None)) == 2
+
+
+def test_build_with_a_use_drops_the_curricula_that_do_not_permit_it() -> None:
+    registry = _use_registry()
+    router = registry.build("train", use="router")
+    assert [row["curriculum"] for row in router] == ["shared"]  # "*" still permits router
+    sft = registry.build("train", use="sft")
+    assert [row["curriculum"] for row in sft] == ["shared", "sft_only"]
+
+
+def test_register_rejects_an_empty_or_blank_uses_tuple() -> None:
+    registry = Registry()
+    with pytest.raises(ValueError, match="at least one consumer"):
+        registry.register("empty", splits=("train",), uses=())
+    with pytest.raises(ValueError, match="non-blank strings"):
+        registry.register("blank", splits=("train",), uses=("sft", "  "))
+
+
+def test_foreign_use_rows_finds_the_rows_a_use_should_never_have_seen() -> None:
+    registry = _use_registry()
+    rows = registry.build("train") + registry.build("validation")
+    foreign = foreign_use_rows(registry, rows, use="router", name_field="curriculum")
+    assert [row["group_id"] for row in foreign] == ["sft|train", "sft|validation"]
+    assert foreign_use_rows(registry, rows, use="sft", name_field="curriculum") == []
+
+
+def test_foreign_use_rows_skips_rows_whose_curriculum_it_does_not_know() -> None:
+    """A corpus assembled from several sources is still checkable against the
+    one registry that knows about the restricted families."""
+    registry = _use_registry()
+    rows = [_named_row("from elsewhere", "g1", "not_registered"), {"group_id": "g2"}]
+    assert foreign_use_rows(registry, rows, use="router", name_field="curriculum") == []
+
+
+def test_compose_use_filters_the_build_end_to_end() -> None:
+    registry = _use_registry()
+    splits, report = compose({"train": [], "validation": [], "test": []}, registry, use="router")
+    assert report["split_counts"] == {"train": 1, "validation": 1, "test": 0}
+    assert foreign_use_rows(
+        registry,
+        [row for rows in splits.values() for row in rows],
+        use="router",
+        name_field="curriculum",
+    ) == []
+    unfiltered, _ = compose({"train": [], "validation": [], "test": []}, registry)
+    assert len(unfiltered["train"]) == 2
