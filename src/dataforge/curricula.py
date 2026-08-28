@@ -31,11 +31,17 @@ REPORT_CONTRACT = "dataforge-curriculum-report"
 LeakCheck = Callable[[Mapping[str, Sequence[Mapping[str, Any]]]], Mapping[str, Any]]
 
 
+#: The ``uses`` entry meaning "every consumer": a curriculum tagged with it is
+#: included by :meth:`Registry.build` whatever ``use`` is asked for.
+ANY_USE = "*"
+
+
 @dataclass(frozen=True)
 class Curriculum:
     name: str
     splits: tuple[str, ...]
     func: CurriculumFunc
+    uses: tuple[str, ...] = (ANY_USE,)
 
 
 class Registry:
@@ -45,12 +51,39 @@ class Registry:
         self._curricula: list[Curriculum] = []
 
     def register(
-        self, name: str, splits: Sequence[str]
+        self, name: str, splits: Sequence[str], uses: Sequence[str] = (ANY_USE,)
     ) -> Callable[[CurriculumFunc], CurriculumFunc]:
+        """Register ``name`` as producing rows for ``splits``, for ``uses``.
+
+        ``uses`` declares which consumers of this dataset a curriculum's rows
+        are allowed to reach; the default :data:`ANY_USE` means all of them.
+        Some families must reach SFT train/validation and never a secondary
+        consumer -- a router's training export, a public sample -- and the
+        convention "everyone remembers to filter that family out" rots the
+        moment a new family is added by someone who did not know. Declaring it
+        at registration puts the policy next to the rows and lets
+        :meth:`build` and :func:`foreign_use_rows` enforce it.
+
+        An empty ``uses``, or one containing a blank or non-string entry,
+        raises here rather than silently excluding the curriculum from every
+        filtered build.
+        """
+        declared = tuple(uses)
+        if not declared:
+            raise ValueError(
+                f"curriculum {name!r}: uses must name at least one consumer "
+                f"(or {ANY_USE!r} for all of them)"
+            )
+        for use in declared:
+            if not isinstance(use, str) or not use.strip():
+                raise ValueError(f"curriculum {name!r}: uses entries must be non-blank strings")
+
         def decorator(func: CurriculumFunc) -> CurriculumFunc:
             if any(existing.name == name for existing in self._curricula):
                 raise ValueError(f"curriculum {name!r} is already registered")
-            self._curricula.append(Curriculum(name=name, splits=tuple(splits), func=func))
+            self._curricula.append(
+                Curriculum(name=name, splits=tuple(splits), func=func, uses=declared)
+            )
             return func
 
         return decorator
@@ -59,24 +92,194 @@ class Registry:
     def curricula(self) -> tuple[Curriculum, ...]:
         return tuple(self._curricula)
 
-    def build(self, split: str) -> list[dict[str, Any]]:
+    def build(self, split: str, use: str | None = None) -> list[dict[str, Any]]:
+        """Rows for ``split`` from every curriculum that permits ``use``.
+
+        ``use=None`` (the default) applies no filter at all and is what the
+        primary build wants: the full corpus, exactly as before ``uses``
+        existed. A ``use`` string keeps only curricula whose ``uses`` contains
+        it or :data:`ANY_USE`.
+        """
         rows: list[dict[str, Any]] = []
         for curriculum in self._curricula:
-            if split in curriculum.splits:
-                rows.extend(curriculum.func(split))
+            if split not in curriculum.splits:
+                continue
+            if not permits_use(curriculum, use):
+                continue
+            rows.extend(curriculum.func(split))
         return rows
+
+
+def permits_use(curriculum: Curriculum, use: str | None) -> bool:
+    """Whether ``curriculum``'s rows may reach ``use`` (``None`` meaning any)."""
+    return use is None or ANY_USE in curriculum.uses or use in curriculum.uses
+
+
+def foreign_use_rows(
+    registry: Registry,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    use: str,
+    name_field: str,
+) -> list[Mapping[str, Any]]:
+    """The rows of ``rows`` whose curriculum does **not** permit ``use``.
+
+    The audit side of ``uses``: :meth:`Registry.build` decides what goes into an
+    export, and this decides whether an export that already exists is clean.
+    Each row names the curriculum that produced it in ``name_field``; a row
+    whose name is not registered is not this registry's to judge and is skipped,
+    so a corpus assembled from several sources can still be checked against the
+    one registry that knows about the restricted families.
+
+    Returns the offending rows themselves (not copies) in input order, so a
+    caller can name them in an error message.
+    """
+    declared = {registered.name: registered for registered in registry.curricula}
+    foreign: list[Mapping[str, Any]] = []
+    for row in rows:
+        name = row.get(name_field)
+        registered = declared.get(str(name)) if name is not None else None
+        if registered is None or permits_use(registered, use):
+            continue
+        foreign.append(row)
+    return foreign
 
 
 _DEFAULT_REGISTRY = Registry()
 
 
-def curriculum(name: str, splits: Sequence[str]) -> Callable[[CurriculumFunc], CurriculumFunc]:
+def curriculum(
+    name: str, splits: Sequence[str], uses: Sequence[str] = (ANY_USE,)
+) -> Callable[[CurriculumFunc], CurriculumFunc]:
     """Register a curriculum function on the module-level default registry."""
-    return _DEFAULT_REGISTRY.register(name, splits)
+    return _DEFAULT_REGISTRY.register(name, splits, uses)
 
 
 def default_registry() -> Registry:
     return _DEFAULT_REGISTRY
+
+
+@dataclass(frozen=True)
+class BehaviourSeed:
+    """One behaviour mapping, stated once and repeated across surface frames.
+
+    A behaviour a fine-tuned model is missing is not fixed by one beautifully
+    written example. What reaches the weights is the *repetition* of a single
+    mapping -- this situation gets that response -- across enough surface
+    variation that the model learns the mapping rather than the sentence. A
+    seed is that mapping written down: ``frames`` are the ways a customer might
+    raise it, ``finals`` the matching responses, and ``subjects`` the things it
+    is raised about.
+
+    ``subjects`` maps split name to subjects. The subjects a non-train split
+    uses must not appear in train: a behaviour scored on subjects it was
+    trained on measures recall, and the whole reason to hold subjects back is
+    to get an honest generalization signal instead.
+    :func:`behaviour_rows` enforces that rather than trusting it.
+
+    ``frames`` and ``finals`` are parallel: ``finals[i]`` answers ``frames[i]``.
+    Each frame contains ``"{s}"`` where the subject goes; a final may too.
+    ``tags`` is free metadata as a tuple of ``(key, value)`` pairs -- a tuple
+    because the dataclass is frozen and a dict is not hashable -- for a
+    ``row_fn`` to copy onto its rows with ``dict(seed.tags)``.
+    """
+
+    key: str
+    family: str
+    frames: tuple[str, ...]
+    finals: tuple[str, ...]
+    subjects: Mapping[str, tuple[str, ...]]
+    tags: tuple[tuple[str, Any], ...] = ()
+
+
+def behaviour_rows(
+    seeds: Sequence[BehaviourSeed],
+    split: str,
+    *,
+    row_fn: Callable[..., dict[str, Any]],
+    frames_per_validation_subject: int = 2,
+) -> list[dict[str, Any]]:
+    """Expand ``seeds`` into rows for ``split``, subject by subject, frame by frame.
+
+    Train gets every frame of every train subject -- the repetition is the
+    point. Any other split gets the first ``frames_per_validation_subject``
+    frames of its own (held-back) subjects, which is enough to tell whether the
+    behaviour generalized without spending an evaluation split on surface
+    variation.
+
+    ``row_fn`` is called once per (subject, frame) with keyword arguments
+    ``seed``, ``split``, ``subject``, ``frame_index``, ``variant`` (a 0-based
+    counter within the seed), ``text`` (the formatted frame) and ``final`` (the
+    formatted final), and returns the row to append. Every schema decision --
+    ids, labels, provenance, which row shape to build -- stays there, which is
+    what keeps this function schema-agnostic.
+
+    Fails fast, with the seed named, when a seed has no frames, when frames and
+    finals differ in length, when a frame carries no ``"{s}"`` placeholder, when
+    a subject appears in both train and another split, when two seeds in one
+    call share ``(family, key)``, or when a seed has no subjects for ``split``.
+    Each of those is a silent corpus defect otherwise: a behaviour that trains
+    on the subject it is scored on, or a mapping that quietly produces nothing.
+    """
+    if frames_per_validation_subject < 1:
+        raise ValueError(
+            "behaviour_rows: frames_per_validation_subject must be at least 1, got "
+            f"{frames_per_validation_subject!r}"
+        )
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for seed in seeds:
+        name = f"{seed.family}/{seed.key}"
+        identity = (seed.family, seed.key)
+        if identity in seen:
+            raise ValueError(f"behaviour_rows: two seeds share (family, key) {name}")
+        seen.add(identity)
+        if not seed.frames:
+            raise ValueError(f"behaviour seed {name}: frames must not be empty")
+        if len(seed.frames) != len(seed.finals):
+            raise ValueError(
+                f"behaviour seed {name}: {len(seed.frames)} frames but {len(seed.finals)} "
+                "finals; each frame needs the final that answers it"
+            )
+        for index, frame in enumerate(seed.frames):
+            if "{s}" not in frame:
+                raise ValueError(
+                    f"behaviour seed {name}: frame {index} has no '{{s}}' subject placeholder"
+                )
+        train_subjects = set(seed.subjects.get("train", ()))
+        for other, subjects in seed.subjects.items():
+            if other == "train":
+                continue
+            overlap = train_subjects & set(subjects)
+            if overlap:
+                raise ValueError(
+                    f"behaviour seed {name}: subjects {sorted(overlap)} appear in both train and "
+                    f"{other}; held-back subjects are the generalization signal"
+                )
+        if split not in seed.subjects:
+            raise ValueError(f"behaviour seed {name}: no subjects for split {split!r}")
+
+        frame_count = (
+            len(seed.frames)
+            if split == "train"
+            else min(frames_per_validation_subject, len(seed.frames))
+        )
+        variant = 0
+        for subject in seed.subjects[split]:
+            for frame_index in range(frame_count):
+                rows.append(
+                    row_fn(
+                        seed=seed,
+                        split=split,
+                        subject=subject,
+                        frame_index=frame_index,
+                        variant=variant,
+                        text=seed.frames[frame_index].format(s=subject),
+                        final=seed.finals[frame_index].format(s=subject),
+                    )
+                )
+                variant += 1
+    return rows
 
 
 def _iter_strings(value: Any) -> Iterable[str]:
@@ -327,6 +530,7 @@ def compose(
     extra_leak_checks: Sequence[LeakCheck] = (),
     pre_dedup_checks: Sequence[LeakCheck] = (),
     pii_fields: Sequence[str] | None = None,
+    use: str | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     """Run every registered curriculum, enforce non-leakage, dedup, and report.
 
@@ -359,8 +563,11 @@ def compose(
     rejected. Their keys are merged into ``report["leakage"]`` for the record,
     under the same collision rule as ``extra_leak_checks``.
 
-    Finally, :func:`build_report` produces the governance report over the
-    deduplicated result.
+    ``use`` is forwarded to :meth:`Registry.build`: ``None`` (the default) runs
+    every registered curriculum, and a use string runs only those whose ``uses``
+    permit that consumer. The seed splits are never filtered -- they are the
+    caller's own rows, not the registry's -- so a filtered build still starts
+    from whatever the caller passed in.
     """
     split_order = tuple(split_order)
 
@@ -408,7 +615,7 @@ def compose(
             _track(row, split)
 
     for split in split_order:
-        for row in registry.build(split):
+        for row in registry.build(split, use=use):
             _track(row, split)
             splits[split].append(row)
 
