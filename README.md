@@ -262,11 +262,19 @@ caller's, because it is the row schema's business.
 
 `guards.fuzzy_duplicate_leaks(splits, field=..., threshold=0.995,
 group_fn=...)` flags pairs of rows whose normalized values are nearly identical
-but not equal -- exact duplicates stay `duplicate_text_leaks`' job, so the two
-checks partition the problem. Comparison is within one split and, with
-`group_fn`, within one group, which keeps the quadratic term per family rather
-than per corpus; the cheap `real_quick_ratio`/`quick_ratio` bounds short-circuit
-before `ratio()`.
+but not equal -- pairs that normalize to the same value stay
+`duplicate_text_leaks`' job. That division of labour is close to a partition but
+not exactly one: this guard normalizes with `normalize_text` and that one
+defaults to `normalize_text_ascii`, so a pair equal only under the ASCII
+normalizer (`"café"`/`"cafe"`) is reported by both.
+
+Comparison is within one split and, with `group_fn`, within one group. Both are
+cost bounds on an O(n^2) pass rather than claims about where duplicates live:
+the quadratic term ends up per family instead of per corpus, and the cheap
+`real_quick_ratio`/`quick_ratio` bounds short-circuit before `ratio()`. A
+cross-split near-duplicate is consequently covered by nothing here --
+`secondary_field_leaks` buckets on exact normalized equality and will not see it
+either.
 
 ### `uses`: which consumers a curriculum's rows may reach
 

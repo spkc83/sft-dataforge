@@ -92,7 +92,7 @@ class Registry:
     def curricula(self) -> tuple[Curriculum, ...]:
         return tuple(self._curricula)
 
-    def build(self, split: str, use: str | None = None) -> list[dict[str, Any]]:
+    def build(self, split: str, *, use: str | None = None) -> list[dict[str, Any]]:
         """Rows for ``split`` from every curriculum that permits ``use``.
 
         ``use=None`` (the default) applies no filter at all and is what the
@@ -131,17 +131,33 @@ def foreign_use_rows(
     so a corpus assembled from several sources can still be checked against the
     one registry that knows about the restricted families.
 
+    That skip is why ``name_field`` missing from **every** row raises instead:
+    a typo, or a corpus that was never stamped, would otherwise make every row
+    unjudgeable and return a clean, entirely meaningless empty list. Rows with
+    no rows at all are not an error -- an empty export carries no signal either
+    way.
+
     Returns the offending rows themselves (not copies) in input order, so a
     caller can name them in an error message.
     """
     declared = {registered.name: registered for registered in registry.curricula}
     foreign: list[Mapping[str, Any]] = []
+    rows_seen = False
+    field_seen = False
     for row in rows:
+        rows_seen = True
+        if name_field in row:
+            field_seen = True
         name = row.get(name_field)
         registered = declared.get(str(name)) if name is not None else None
         if registered is None or permits_use(registered, use):
             continue
         foreign.append(row)
+    if rows_seen and not field_seen:
+        raise ValueError(
+            f"foreign_use_rows: no row carries the curriculum name field {name_field!r}, so "
+            "every row is unjudgeable and the audit would pass vacuously"
+        )
     return foreign
 
 
@@ -192,6 +208,24 @@ class BehaviourSeed:
     tags: tuple[tuple[str, Any], ...] = ()
 
 
+def _check_formattable(seed_name: str, kind: str, index: int, template: str) -> None:
+    """Raise a named ``ValueError`` for a template ``str.format`` would reject.
+
+    A literal brace or a second placeholder (``"{s} for {who}"``) otherwise
+    surfaces as a bare ``KeyError``/``ValueError`` from deep inside the
+    expansion, naming neither the seed nor which string was wrong. Checked up
+    front for every frame *and* final, not lazily during expansion, so a defect
+    in a template this split does not happen to use is still caught.
+    """
+    try:
+        template.format(s="")
+    except (KeyError, IndexError, ValueError) as error:
+        raise ValueError(
+            f"behaviour seed {seed_name}: {kind} {index} is not a usable template ({error!r}); "
+            "'{s}' is the only placeholder, and a literal brace must be doubled"
+        ) from error
+
+
 def behaviour_rows(
     seeds: Sequence[BehaviourSeed],
     split: str,
@@ -216,10 +250,12 @@ def behaviour_rows(
 
     Fails fast, with the seed named, when a seed has no frames, when frames and
     finals differ in length, when a frame carries no ``"{s}"`` placeholder, when
-    a subject appears in both train and another split, when two seeds in one
-    call share ``(family, key)``, or when a seed has no subjects for ``split``.
-    Each of those is a silent corpus defect otherwise: a behaviour that trains
-    on the subject it is scored on, or a mapping that quietly produces nothing.
+    a frame or final is not a template ``str.format`` accepts, when a subject
+    appears in both train and another split, when two seeds in one call share
+    ``(family, key)``, or when a seed has no subjects -- or an empty subject
+    list -- for ``split``. Each of those is a silent corpus defect otherwise: a
+    behaviour that trains on the subject it is scored on, or a mapping that
+    quietly produces nothing.
     """
     if frames_per_validation_subject < 1:
         raise ValueError(
@@ -246,6 +282,9 @@ def behaviour_rows(
                 raise ValueError(
                     f"behaviour seed {name}: frame {index} has no '{{s}}' subject placeholder"
                 )
+        for index, (frame, final) in enumerate(zip(seed.frames, seed.finals, strict=True)):
+            _check_formattable(name, "frame", index, frame)
+            _check_formattable(name, "final", index, final)
         train_subjects = set(seed.subjects.get("train", ()))
         for other, subjects in seed.subjects.items():
             if other == "train":
@@ -258,6 +297,11 @@ def behaviour_rows(
                 )
         if split not in seed.subjects:
             raise ValueError(f"behaviour seed {name}: no subjects for split {split!r}")
+        if not seed.subjects[split]:
+            raise ValueError(
+                f"behaviour seed {name}: split {split!r} has an empty subject list, so this "
+                "seed would contribute nothing to it"
+            )
 
         frame_count = (
             len(seed.frames)

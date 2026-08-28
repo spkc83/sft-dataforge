@@ -329,32 +329,43 @@ def fuzzy_duplicate_leaks(
     """Flag pairs of rows whose normalized ``field`` values are *nearly* -- but
     not exactly -- the same.
 
-    Exact duplicates are :func:`duplicate_text_leaks`' job and are deliberately
-    skipped here, so the two checks partition the problem instead of both
-    reporting the same bucket. What this one catches is the pair an exact-match
-    check cannot see: two rows a generator emitted from one template that differ
-    by a comma, a name, or a trailing word. At training scale those are the same
-    example twice -- the model gets the repetition without the variety the second
-    row was supposed to buy.
+    Pairs that normalize to the *same* value are skipped: those are
+    :func:`duplicate_text_leaks`' job. What this one catches is the pair an
+    exact-match check cannot see -- two rows a generator emitted from one
+    template that differ by a comma, a name, or a trailing word. At training
+    scale those are the same example twice: the model gets the repetition
+    without the variety the second row was supposed to buy.
 
-    Comparison is within one split (a cross-split near-duplicate is a leak
-    question, answered by :func:`secondary_field_leaks`) and, when ``group_fn``
-    is given, within one group: ``group_fn(row)`` returns the group key, and only
-    rows sharing it are compared. That is what keeps the O(n^2) pass affordable
-    -- group by the scenario family, or whatever partition makes two rows
-    comparable at all, and the quadratic term is per family rather than per
-    corpus. The default puts every row of a split in one group.
+    The split of work between the two checks is close to a partition but not
+    exactly one, and the difference is the normalizer. This function uses
+    :func:`dataforge.rows.normalize_text` (Unicode-aware) while
+    ``duplicate_text_leaks`` defaults to
+    :func:`dataforge.rows.normalize_text_ascii` (every non-``[a-z0-9]`` run
+    becomes a space). A pair that is equal under the ASCII normalizer but not
+    under this one -- ``"café"``/``"cafe"`` -- is an exact duplicate there and a
+    near-duplicate here, and is reported by both.
 
-    Values are compared after :func:`dataforge.rows.normalize_text`; rows whose
-    ``field`` is missing, non-``str`` or blank are skipped. ``ratio`` is
-    ``difflib.SequenceMatcher.ratio()`` rounded to four places, and the cheap
+    Comparison is within one split and, when ``group_fn`` is given, within one
+    group: ``group_fn(row)`` returns the group key, and only rows sharing it are
+    compared. Both restrictions are cost bounds on an O(n^2) pass, not claims
+    about where duplicates live -- group by the scenario family, or whatever
+    partition makes two rows comparable at all, and the quadratic term is per
+    family rather than per corpus. **A cross-split near-duplicate is therefore
+    not covered by anything here**: :func:`secondary_field_leaks` buckets on
+    exact normalized equality and will not see it either. Pass
+    ``splits_checked=(one_split,)`` per split if that matters, or run the pass
+    over a merged mapping.
+
+    Rows whose ``field`` is missing, non-``str`` or blank are skipped. ``ratio``
+    is ``difflib.SequenceMatcher.ratio()`` rounded to four places, and the cheap
     ``real_quick_ratio``/``quick_ratio`` upper bounds short-circuit the expensive
     comparison first.
 
     The key is ``fuzzy_duplicate_leaks`` (entries ``{"split", "group",
     "index_a", "index_b", "ratio"}``, the indexes being positions in that
     split's row sequence), so it gates via :func:`dataforge.emit.default_gates`
-    like every other ``*_leaks`` key.
+    like every other ``*_leaks`` key. There is deliberately no ``_leak_count``
+    companion: the list alone gates, and a second key could only disagree with it.
     """
     if not 0.0 < threshold <= 1.0:
         raise ValueError(f"fuzzy_duplicate_leaks: threshold must be in (0, 1], got {threshold!r}")
@@ -395,6 +406,30 @@ def fuzzy_duplicate_leaks(
                         }
                     )
     return {"fuzzy_duplicate_leaks": leaks}
+
+
+def _require_field_present(
+    guard: str,
+    checked: Sequence[tuple[str, Sequence[Mapping[str, Any]]]],
+    fields: Sequence[str],
+) -> None:
+    """Raise unless some checked row carries at least one name in ``fields``.
+
+    The typo guard the invariant guards share, and the rule
+    :func:`secondary_field_leaks` already applies: a field name that exists on
+    no row is a disarmed gate that keeps reporting a reassuring zero. Key
+    absence is the error, not "no usable value" -- a key present with a blank or
+    non-``str`` value still proves the name is real. A corpus with no checked
+    rows at all carries no signal either way and is not an error.
+    """
+    if not any(rows for _, rows in checked):
+        return
+    if any(field in row for _, rows in checked for row in rows for field in fields):
+        return
+    if len(fields) == 1:
+        raise ValueError(f"{guard}: field {fields[0]!r} is absent from every checked row")
+    names = ", ".join(repr(field) for field in fields)
+    raise ValueError(f"{guard}: none of the fields {names} is present on any checked row")
 
 
 def _normalized_unique(values: Iterable[str]) -> list[str]:
@@ -438,12 +473,21 @@ def probe_exclusion_leaks(
 
     ``fields`` decides the surface: the row's own utterance field catches an
     exact probe, while a rendered-transcript field also catches a probe phrase
-    that arrived through a context turn. ``splits_checked`` defaults to the
-    trainable splits, so the probes' own frozen split is exempt by construction.
+    that arrived through a context turn. Raises when none of those names is
+    present on any checked row -- like the empty-probe case, a field-name typo
+    would otherwise leave the gate reporting a reassuring zero forever.
+    ``splits_checked`` defaults to the trainable splits, so the probes' own
+    frozen split is exempt by construction.
+
+    A field that matched a whole probe is not then searched for fragments: the
+    probe is the finding, and its fragments are by construction inside it, so
+    reporting both would be one leak counted twice.
 
     The key is ``probe_exclusion_leaks`` (entries ``{"split", "index", "field",
     "kind", "value"}``, where ``kind`` is ``"probe"`` or ``"fragment"`` and
-    ``value`` is the normalized probe or fragment that matched).
+    ``value`` is the normalized probe or fragment that matched). There is
+    deliberately no ``_leak_count`` companion: the list alone gates, and a
+    second key could only disagree with it.
     """
     normalized_probes = _normalized_unique(probes)
     normalized_fragments = _normalized_unique(fragments)
@@ -452,11 +496,11 @@ def probe_exclusion_leaks(
             "probe_exclusion_leaks: pass probes and/or fragments -- a probe gate with nothing "
             "to look for passes vacuously"
         )
+    checked = [(split, rows) for split, rows in splits.items() if split in splits_checked]
+    _require_field_present("probe_exclusion_leaks", checked, fields)
     probe_set = set(normalized_probes)
     leaks: list[dict[str, Any]] = []
-    for split, rows in splits.items():
-        if split not in splits_checked:
-            continue
+    for split, rows in checked:
         for index, row in enumerate(rows):
             for field in fields:
                 value = row.get(field)
@@ -475,6 +519,7 @@ def probe_exclusion_leaks(
                             "value": normalized,
                         }
                     )
+                    continue
                 for fragment in normalized_fragments:
                     if fragment in normalized:
                         leaks.append(
@@ -598,16 +643,28 @@ def required_markers(
     This is the positive counterpart to :func:`banned_patterns`: it is how a
     curriculum states that a particular behaviour must actually *say* the thing
     it exists to teach.
+
+    An empty ``markers_by_tag``, and a tag whose markers all normalize away to
+    nothing (``("?!",)``), both raise: either one is an invariant that can never
+    fire, which here means every row silently satisfies a requirement nobody
+    ever stated.
     """
-    normalized_markers = {
-        tag: [normalize_text(marker) for marker in markers if normalize_text(marker)]
-        for tag, markers in markers_by_tag.items()
-    }
+    if not markers_by_tag:
+        raise ValueError("required_markers: pass at least one tag with markers")
+    normalized_markers: dict[str, list[str]] = {}
+    for tag, markers in markers_by_tag.items():
+        usable = [normalize_text(marker) for marker in markers if normalize_text(marker)]
+        if not usable:
+            raise ValueError(
+                f"required_markers: tag {tag!r} has no marker left after normalization, so "
+                "every row under it would pass unconditionally"
+            )
+        normalized_markers[tag] = usable
 
     def invariant(value: str, row: Mapping[str, Any]) -> str | None:
         tag = tag_fn(row)
         markers = normalized_markers.get(tag)
-        if not markers:
+        if markers is None:
             return None
         normalized = normalize_text(value)
         for marker in markers:
@@ -664,17 +721,13 @@ def field_invariant_leaks(
     gate that still reports a reassuring zero.
 
     The key is ``field_invariant_leaks`` (entries ``{"split", "index",
-    "invariant", "detail"}``).
+    "invariant", "detail"}``). There is deliberately no ``_leak_count``
+    companion: the list alone gates, and a second key could only disagree with it.
     """
     if not invariants:
         raise ValueError(f"field_invariant_leaks({field!r}): pass at least one invariant")
     checked = [(split, rows) for split, rows in splits.items() if split in splits_checked]
-    rows_seen = any(rows for _, rows in checked)
-    field_seen = any(field in row for _, rows in checked for row in rows)
-    if rows_seen and not field_seen:
-        raise ValueError(
-            f"field_invariant_leaks: field {field!r} is absent from every checked row"
-        )
+    _require_field_present("field_invariant_leaks", checked, (field,))
 
     leaks: list[dict[str, Any]] = []
     for split, rows in checked:
@@ -725,7 +778,8 @@ def unsupported_claim_leaks(
     dataset is for and is never flagged.
 
     The key is ``unsupported_claim_leaks`` (entries ``{"split", "index",
-    "pattern"}``).
+    "pattern"}``). There is deliberately no ``_leak_count`` companion: the list
+    alone gates, and a second key could only disagree with it.
     """
     if not claim_patterns:
         raise ValueError(f"unsupported_claim_leaks({field!r}): pass at least one claim pattern")

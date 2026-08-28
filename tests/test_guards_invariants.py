@@ -118,11 +118,15 @@ def test_fuzzy_duplicate_leaks_skips_splits_outside_splits_checked() -> None:
     assert len(checked["fuzzy_duplicate_leaks"]) == 1
 
 
-def test_fuzzy_duplicate_leaks_ignores_missing_and_blank_values() -> None:
-    splits = {"train": [{"group_id": "g1"}, _row("   "), _row(CARD_4821)]}
-    assert fuzzy_duplicate_leaks(splits, field="user_text", threshold=0.5) == {
-        "fuzzy_duplicate_leaks": []
-    }
+def test_fuzzy_duplicate_leaks_skips_missing_and_blank_values_and_still_pairs_the_rest() -> None:
+    """The skip has to be load bearing, so the split also holds a genuine
+    near-duplicate pair: an unskipped ``None`` would fail on comparison rather
+    than pass, and indexes that were positions in the filtered subset rather
+    than in the split would read (0, 1)."""
+    splits = {"train": [{"group_id": "g1"}, _row("   "), _row(CARD_4821), _row(CARD_4822)]}
+    result = fuzzy_duplicate_leaks(splits, field="user_text", threshold=0.9)
+    (entry,) = result["fuzzy_duplicate_leaks"]
+    assert (entry["index_a"], entry["index_b"]) == (2, 3)
 
 
 def test_fuzzy_duplicate_leaks_rejects_an_out_of_range_threshold() -> None:
@@ -200,6 +204,35 @@ def test_probe_exclusion_leaks_refuses_to_run_with_nothing_to_look_for() -> None
         probe_exclusion_leaks({"train": [_row("anything")]})
 
 
+def test_probe_exclusion_leaks_reports_a_whole_probe_once_not_also_its_fragment() -> None:
+    """The fragments of a matched probe are inside it by construction, so
+    reporting both would be one leak counted twice."""
+    splits = {"train": [_row(PROBE)]}
+    result = probe_exclusion_leaks(
+        splits, probes=[PROBE], fragments=[FRAGMENT], fields=("user_text",)
+    )
+    (entry,) = result["probe_exclusion_leaks"]
+    assert entry["kind"] == "probe"
+
+
+def test_probe_exclusion_leaks_raises_when_no_named_field_exists_on_any_row() -> None:
+    """A field-name typo is the other way this gate passes vacuously."""
+    splits = {"train": [_row(PROBE)]}
+    with pytest.raises(ValueError, match="usr_text"):
+        probe_exclusion_leaks(splits, probes=[PROBE], fields=("usr_text",))
+    with pytest.raises(ValueError, match="none of the fields"):
+        probe_exclusion_leaks(splits, probes=[PROBE], fields=("usr_text", "txet"))
+
+
+def test_probe_exclusion_leaks_field_check_is_silent_when_no_row_is_checked() -> None:
+    """An empty corpus carries no signal either way; only a corpus that has
+    rows and none of the fields is evidence of a typo."""
+    splits = {"train": [], "test": [_row(PROBE)]}
+    assert probe_exclusion_leaks(splits, probes=[PROBE], fields=("no_such_field",)) == {
+        "probe_exclusion_leaks": []
+    }
+
+
 def _final(text: str, **extra: Any) -> dict[str, Any]:
     return {"final_response": text, **extra}
 
@@ -256,6 +289,15 @@ def test_required_markers_are_keyed_by_the_rows_tag() -> None:
     (entry,) = result["field_invariant_leaks"]
     assert entry["index"] == 0
     assert entry["invariant"] == "required_markers"
+
+
+def test_required_markers_rejects_an_invariant_that_could_never_fire() -> None:
+    """An empty map, or a tag whose markers all normalize away, means every row
+    silently satisfies a requirement nobody ever stated."""
+    with pytest.raises(ValueError, match="at least one tag"):
+        required_markers({}, tag_fn=lambda row: "refusal")
+    with pytest.raises(ValueError, match="no marker left after normalization"):
+        required_markers({"refusal": ("?!", "  ")}, tag_fn=lambda row: "refusal")
 
 
 def test_min_word_count_fires_on_a_too_short_value() -> None:
