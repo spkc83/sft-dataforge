@@ -724,3 +724,42 @@ def test_compose_use_filters_the_build_end_to_end() -> None:
     ) == []
     unfiltered, _ = compose({"train": [], "validation": [], "test": []}, registry)
     assert len(unfiltered["train"]) == 2
+
+
+def test_behaviour_rows_rejects_a_template_str_format_cannot_use() -> None:
+    """A literal brace or a second placeholder otherwise surfaces as a bare
+    KeyError from inside the expansion, naming neither seed nor string."""
+    bad_frame = _seed(frames=("can you {s}", "what about {s} and {other}", "could you {s}"))
+    with pytest.raises(ValueError, match="frame 1 is not a usable template"):
+        behaviour_rows([bad_frame], "train", row_fn=_behaviour_row)
+    bad_final = _seed(finals=("a stray { brace", "I cannot {s}.", "No: {s}."))
+    with pytest.raises(ValueError, match="final 0 is not a usable template"):
+        behaviour_rows([bad_final], "train", row_fn=_behaviour_row)
+
+
+def test_behaviour_rows_checks_templates_the_split_would_never_reach() -> None:
+    """Validation only expands the first two frames, but a defect in the third
+    is still a defect in the seed."""
+    seed = _seed(frames=("can you {s}", "i need you to {s}", "could you {s} and {other}"))
+    with pytest.raises(ValueError, match="frame 2 is not a usable template"):
+        behaviour_rows([seed], "validation", row_fn=_behaviour_row)
+
+
+def test_behaviour_rows_rejects_an_empty_subject_list_for_the_split() -> None:
+    seed = _seed(subjects={"train": ("book a flight",), "validation": ()})
+    with pytest.raises(ValueError, match="empty subject list"):
+        behaviour_rows([seed], "validation", row_fn=_behaviour_row)
+
+
+def test_foreign_use_rows_raises_when_no_row_carries_the_name_field() -> None:
+    """Unregistered names are skipped, so a typo'd `name_field` would make every
+    row unjudgeable and return a clean, entirely meaningless empty list."""
+    registry = _use_registry()
+    rows = registry.build("train")
+    with pytest.raises(ValueError, match="curiculum"):
+        foreign_use_rows(registry, rows, use="router", name_field="curiculum")
+
+
+def test_foreign_use_rows_accepts_an_empty_row_sequence() -> None:
+    """An empty export carries no signal either way."""
+    assert foreign_use_rows(_use_registry(), [], use="router", name_field="curriculum") == []
