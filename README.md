@@ -50,8 +50,8 @@ library and live only in `examples/banking` as a worked example.
 | --- | --- |
 | `dataforge/taxonomy.py` | `Taxonomy` dataclass (built from a dict/JSON): intent hierarchy, legal action/entity-resolution pairs per lane, tool compatibility. `labels_for_example` / `validate_hierarchical_labels`. |
 | `dataforge/rows.py` | The row contract: `render_context` (the `[PRIOR_STATE]` / `[CURRENT_USER]` / `[PREVIOUS_ASSISTANT]` / `[PREVIOUS_USER]` flattening), `make_row` (labels + multi-hot relations + provenance), `normalize_text`. |
-| `dataforge/curricula.py` | `@curriculum` registration on a `Registry`; `compose` runs every curriculum per split, enforces group/trajectory/pair non-leakage, deduplicates with eval-wins ordering, and produces the governance report. |
-| `dataforge/guards.py` | PII regexes, held-out exact + n-gram leak detection, `leakage_report`. |
+| `dataforge/curricula.py` | `@curriculum` registration on a `Registry`; `compose` runs every curriculum per split, enforces group/trajectory/pair non-leakage, deduplicates with eval-wins ordering, and produces the governance report. Also `BehaviourSeed`/`behaviour_rows` (hand-authored behaviour curricula) and the `uses` tag with `foreign_use_rows`. |
+| `dataforge/guards.py` | PII regexes, held-out exact + n-gram leak detection, `leakage_report`; the duplicate/near-duplicate guards, and the build-time invariant guards (`field_invariant_leaks` and its primitives, `probe_exclusion_leaks`, `unsupported_claim_leaks`). |
 | `dataforge/emit.py` | Canonical jsonl encoding, `write_dataset` (gates, split files, manifest, data card), `write_source_lock`, `verify_release_split_digests`. |
 | `dataforge/teacher.py` | `immutable_hash`, `export_teacher_requests`, `import_teacher_responses`, `scrub_fields`, `compute_teacher_prompt_hash` -- the wording-only teacher realization harness. |
 | `dataforge/checks.py` | The teacher-batch checker: `check_teacher_batch` over a `Batch` of request/response/record triples, and the generic rule factories (`hash_pinned`, `min_words`, `banned_pattern`, `unique_normalized`, `opening_ngram_cap`, ...). |
@@ -189,6 +189,106 @@ build must set: `compose`/`build_report` default `secondary_leak_fields` to
 `secondary_leak_fields=("user_text",)` (as the example does) rather than
 letting the default fail the build.
 
+## Behaviour curricula and build-time invariants
+
+A second set of mechanisms, carried over from a later round of the same banking
+work. That round started from four behaviour gaps a fine-tuned model still had
+at the weight level -- things no amount of prompting fixed -- and closed them
+with a small hand-authored curriculum of repeated behaviour mappings, strict
+build-time invariants over those rows, subjects held back from training, and a
+gate proving the evaluation probes never reached the training data. These are
+the generic forms of each of those.
+
+### One behaviour, repeated across frames, with subjects held back
+
+`curricula.BehaviourSeed` states a behaviour once: `frames` are the ways a
+customer might raise it, `finals` the matching responses, and `subjects` the
+things it is raised about, keyed by split. `curricula.behaviour_rows(seeds,
+split, row_fn=...)` expands it -- every frame of every train subject, and the
+first `frames_per_validation_subject` frames for any other split.
+
+Two things are deliberate. Repetition of one mapping across surface frames is
+what actually reaches the weights; a single beautifully written example does
+not. And the subjects a non-train split uses must be disjoint from train's --
+`behaviour_rows` raises rather than trusting it -- because a behaviour scored on
+the subjects it was trained on measures recall, not generalization. It also
+fails fast on frames and finals of different lengths, a frame with no `"{s}"`
+placeholder, two seeds sharing `(family, key)`, and a seed with no subjects for
+the split being built. `row_fn` receives `seed`/`split`/`subject`/`frame_index`/
+`variant`/`text`/`final` and returns the row, so every schema decision stays in
+the caller and one seed can serve a classifier build and a conversation build
+unchanged.
+
+### Field invariants, enforced before dedup can hide a violation
+
+`guards.field_invariant_leaks(splits, field=..., invariants=[...])` runs
+per-row invariants and reports every violation. The invariant primitives are
+`no_digits`, `no_questions`, `banned_patterns(patterns, label=...)`,
+`forbidden_terms(terms, label=...)`, `required_markers(markers_by_tag,
+tag_fn=...)` and `min_word_count(n)`; each returns a `(value, row) -> str |
+None` callable, and any callable with a `__name__` works. `row_predicate` scopes
+the check to the rows an invariant is about -- a hand-authored family normally
+holds to rules the rest of the corpus does not.
+
+Wire them through `compose(pre_dedup_checks=...)`, not `extra_leak_checks`: a
+row that breaks an invariant and happens to duplicate a clean sibling would
+otherwise be dropped by dedup, and the build would pass on the strength of the
+row that survived. An absent `field` and an empty `invariants` both raise, for
+the same reason `secondary_field_leaks` raises on a missing field -- a check
+that cannot fire still reports a reassuring zero.
+
+### The probe-exclusion gate
+
+`guards.probe_exclusion_leaks(splits, probes=..., fragments=..., fields=...)`
+flags trainable text that reproduces an evaluation probe: `probes` match a
+normalized field value exactly, `fragments` match as substrings (a paraphrased
+probe keeps its distinctive phrase). Probes held out of training are only held
+out if a gate proves it; this is the check that keeps "the model passed the
+probe" a claim about generalization rather than memorization. `splits_checked`
+defaults to the trainable splits, so the probes' own frozen split is exempt by
+construction, and passing neither probes nor fragments raises.
+
+### Claims without evidence
+
+`guards.unsupported_claim_leaks(splits, field=..., claim_patterns=...,
+evidence_fn=...)` flags a row whose text asserts a completed account action
+while `evidence_fn(row)` is false -- normally "this row carries no tool-call
+turns". A final that says "I have frozen the card" on a row that froze nothing
+trains the model to produce the sentence in place of the action, which is the
+most expensive failure a servicing model has. What counts as evidence is the
+caller's, because it is the row schema's business.
+
+### Near-duplicates
+
+`guards.fuzzy_duplicate_leaks(splits, field=..., threshold=0.995,
+group_fn=...)` flags pairs of rows whose normalized values are nearly identical
+but not equal -- exact duplicates stay `duplicate_text_leaks`' job, so the two
+checks partition the problem. Comparison is within one split and, with
+`group_fn`, within one group, which keeps the quadratic term per family rather
+than per corpus; the cheap `real_quick_ratio`/`quick_ratio` bounds short-circuit
+before `ratio()`.
+
+### `uses`: which consumers a curriculum's rows may reach
+
+`Registry.register(name, splits, uses=("*",))` declares which consumers a
+curriculum's rows are allowed to reach, and `Registry.build(split, use=...)` /
+`compose(use=...)` honour it -- `use=None`, the default, keeps every existing
+caller's behaviour byte for byte. Some families must reach SFT train/validation
+and never a secondary consumer (a router's training export, a public sample),
+and the convention "everyone remembers to filter that family out" rots the
+moment someone adds a family without knowing. Declaring it at registration puts
+the policy next to the rows. `curricula.foreign_use_rows(registry, rows,
+use=..., name_field=...)` is the audit half: given rows that name their
+curriculum, it returns the ones a consumer should never have received, so an
+export built elsewhere can still be checked.
+
+`examples/banking/tool_curricula.py` shows all of it: a `refusal_honesty`
+behaviour curriculum built from one seed with two train subjects and one
+held-back validation subject, tagged `uses=("sft",)`, whose finals hold to
+invariants the tool-calling rows do not; and `build_tool_calls.py` wires the
+invariant, probe-exclusion and unsupported-claim checks through
+`pre_dedup_checks` and asserts a `use="router"` build contains no foreign rows.
+
 ## Quickstart
 
 The worked example in `examples/banking` instantiates every piece of the
@@ -220,11 +320,14 @@ uv run python -m examples.banking.build_tool_calls dist/banking-tool-calls-examp
 `examples/banking/tool_curricula.py` holds the rows -- single-turn `freeze_card`
 and `list_cards` calls, a multi-turn row whose context contains its own
 tool-call pair, a governed counterfactual pair sharing one utterance across two
-decisions, an error envelope, and a frozen test row that deliberately contains
-banned wording. `examples/banking/build_tool_calls.py` is the pipeline:
-pre-dedup uniqueness -> export over `final_response` only -> stub teacher ->
-`scrub_fields` on a context turn -> `check_teacher_batch` -> import accepting
-the pre-scrub hash -> report rebuild -> gated emission.
+decisions, an error envelope, a frozen test row that deliberately contains
+banned wording, and the seed-expanded `refusal_honesty` behaviour curriculum.
+`examples/banking/build_tool_calls.py` is the pipeline: pre-dedup uniqueness,
+field invariants, probe exclusion and unsupported-claim checks -> a `use`-
+filtered router export audited with `foreign_use_rows` -> export over
+`final_response` only -> stub teacher -> `scrub_fields` on a context turn ->
+`check_teacher_batch` -> import accepting the pre-scrub hash -> report rebuild
+-> gated emission.
 `examples/banking/voice_spec.md` is the teacher prompt spec that
 `compute_teacher_prompt_hash` pins.
 

@@ -2,8 +2,9 @@
 
 Covers the mechanisms the example exists to demonstrate: determinism, the
 release gates, the pre-scrub stamp and its projection tag, the frozen-split
-exemption from the banned-wording gate, teacher provenance -- and the two ways
-the build is supposed to fail.
+exemption from the banned-wording gate, teacher provenance, the hand-authored
+behaviour curriculum and its ``uses`` tag -- and every way the build is supposed
+to fail.
 """
 
 from __future__ import annotations
@@ -14,10 +15,12 @@ from typing import Any
 
 import pytest
 
+from dataforge.curricula import foreign_use_rows
 from dataforge.rows import make_conversation_row
 from dataforge.teacher import compute_teacher_prompt_hash
 from examples.banking import build_tool_calls
 from examples.banking.build_tool_calls import (
+    ROUTER_USE,
     TEACHER_CLOSER,
     TEACHER_MODEL,
     VOICE_SPEC_PATH,
@@ -25,7 +28,15 @@ from examples.banking.build_tool_calls import (
     build,
 )
 from examples.banking.taxonomy import TAXONOMY
-from examples.banking.tool_curricula import BANNED_WORDING, SCRUB_RECORD_ID
+from examples.banking.tool_curricula import (
+    BANNED_WORDING,
+    BEHAVIOUR_CURRICULUM,
+    CURRICULUM_FIELD,
+    EVAL_PROBES,
+    REFUSAL_HONESTY_SEED,
+    REGISTRY,
+    SCRUB_RECORD_ID,
+)
 
 BUILT_FILES = (
     "train.jsonl",
@@ -101,7 +112,12 @@ def test_tool_calls_example_passes_its_release_gates(tmp_path: Path) -> None:
     ):
         assert leakage[key] == 0
     assert leakage["banned_wording_leaks"] == []
-    assert report["split_counts"] == {"train": 5, "validation": 3, "test": 2}
+    # The pre-dedup invariant gates, likewise by key: each carries only a
+    # `_leaks` list, and an empty one is what "it ran and found nothing" looks
+    # like -- a missing key would be "it never ran".
+    for key in ("field_invariant_leaks", "probe_exclusion_leaks", "unsupported_claim_leaks"):
+        assert leakage[key] == []
+    assert report["split_counts"] == {"train": 11, "validation": 5, "test": 2}
     # compose's pre-dedup findings are carried into the emitted report, so the
     # manifest on disk distinguishes "the gate ran and passed" from "it was
     # never wired". build_report cannot recompute them: they are about the rows
@@ -228,3 +244,115 @@ def test_an_ungoverned_duplicate_user_text_fails_the_pre_dedup_check(tmp_path: P
     assert "user_text_duplicate_leak_count" in message
     assert "freeze the travel debit one for now" in message
     assert not (tmp_path / "run1" / "train.jsonl").exists()
+
+
+def _behaviour_rows(run_dir: Path, split: str) -> list[dict[str, Any]]:
+    return [row for row in _rows(run_dir)[split] if row["curriculum"] == BEHAVIOUR_CURRICULUM]
+
+
+def test_the_behaviour_curriculum_repeats_one_mapping_across_frames(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run1"
+    build(run_dir)
+    train = _behaviour_rows(run_dir, "train")
+    assert len(train) == 6  # 3 frames x 2 train subjects: the repetition is the point
+    assert {row["behaviour"] for row in train} == {"refusal_honesty"}
+    assert {row["action_name"] for row in train} == {"refuse_out_of_scope"}
+
+
+def test_the_behaviour_validation_subject_is_held_back_from_train(tmp_path: Path) -> None:
+    """The generalization signal: validation is scored on a subject train never
+    saw, so passing it cannot be recall of a memorized frame."""
+    run_dir = tmp_path / "run1"
+    build(run_dir)
+    (held_back,) = REFUSAL_HONESTY_SEED.subjects["validation"]
+    train_text = " ".join(row["user_text"] for row in _behaviour_rows(run_dir, "train"))
+    validation = _behaviour_rows(run_dir, "validation")
+    assert held_back not in train_text
+    assert len(validation) == 2  # first two frames only
+    assert all(held_back in row["user_text"] for row in validation)
+
+
+def test_the_router_export_excludes_the_sft_only_behaviour_family() -> None:
+    """Both halves of the ``uses`` policy: the registry never builds the family
+    into a router export, and the audit agrees about a build that contains it."""
+    everything = REGISTRY.build("train")
+    router = REGISTRY.build("train", use=ROUTER_USE)
+    assert any(row[CURRICULUM_FIELD] == BEHAVIOUR_CURRICULUM for row in everything)
+    assert all(row[CURRICULUM_FIELD] != BEHAVIOUR_CURRICULUM for row in router)
+    foreign = foreign_use_rows(
+        REGISTRY, everything, use=ROUTER_USE, name_field=CURRICULUM_FIELD
+    )
+    assert {row["record_id"] for row in foreign} == {
+        f"train-refusal-honesty-{index}" for index in range(6)
+    }
+    assert foreign_use_rows(REGISTRY, router, use=ROUTER_USE, name_field=CURRICULUM_FIELD) == []
+
+
+def _seed_row(record_id: str, user_text: str, final_response: str, **extra: Any) -> dict[str, Any]:
+    row = make_conversation_row(
+        record_id=record_id,
+        context_messages=[],
+        user_text=user_text,
+        action_turns=[],
+        final_response=final_response,
+        labels=TAXONOMY.labels_for_example(intent=None),
+        example_kind="seeded_defect",
+        source="synthetic-seeded",
+        source_split="train",
+        group_id=f"seeded|{record_id}",
+    )
+    row.update(extra)
+    return row
+
+
+def test_a_probe_that_reaches_training_fails_the_build(tmp_path: Path) -> None:
+    """The gate behind "the model passed the probe": without it, a probe that
+    leaked into training makes the evaluation a memorization test."""
+    leaked = _seed_row(
+        "train-leaked-probe-0",
+        EVAL_PROBES[0],
+        "That charge was authorized before the freeze, so it has not settled yet.",
+    )
+    with pytest.raises(ValueError, match="^pre-dedup check failed:") as error:
+        build(tmp_path / "run1", seed_splits={"train": [leaked]})
+    assert "probe_exclusion_leaks" in str(error.value)
+    assert not (tmp_path / "run1" / "train.jsonl").exists()
+
+
+def test_a_behaviour_row_that_breaks_an_invariant_fails_the_build(tmp_path: Path) -> None:
+    broken = _seed_row(
+        "train-broken-behaviour-0",
+        "can you refinance my mortgage from this chat",
+        "Which part of that did you want me to look at first?",
+        **{CURRICULUM_FIELD: BEHAVIOUR_CURRICULUM},
+    )
+    with pytest.raises(ValueError, match="^pre-dedup check failed:") as error:
+        build(tmp_path / "run1", seed_splits={"train": [broken]})
+    message = str(error.value)
+    assert "field_invariant_leaks" in message
+    assert "no_questions" in message
+    assert not (tmp_path / "run1" / "train.jsonl").exists()
+
+
+def test_a_final_claiming_an_action_it_never_took_fails_the_build(tmp_path: Path) -> None:
+    """No tool turns, so the claim is a fabrication -- and training on it teaches
+    the sentence rather than the action."""
+    fabricated = _seed_row(
+        "train-fabricated-claim-0",
+        "please deal with the card i mentioned a moment ago",
+        "I have frozen that card for you and nothing else on the account changed.",
+    )
+    with pytest.raises(ValueError, match="^pre-dedup check failed:") as error:
+        build(tmp_path / "run1", seed_splits={"train": [fabricated]})
+    assert "unsupported_claim_leaks" in str(error.value)
+    assert not (tmp_path / "run1" / "train.jsonl").exists()
+
+
+def test_every_curriculum_stamps_its_own_name_on_its_rows() -> None:
+    """``foreign_use_rows`` can only judge a row whose curriculum it can name,
+    so a stamp that drifted from its registration would disarm the audit while
+    still reporting clean."""
+    for registered in REGISTRY.curricula:
+        for split in registered.splits:
+            for row in registered.func(split):
+                assert row[CURRICULUM_FIELD] == registered.name
