@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from difflib import SequenceMatcher
 from typing import Any
 
 from dataforge.rows import canonical_json_bytes, normalize_text, normalize_text_ascii
+
+#: One field invariant: given a field's raw value and the row it came from,
+#: return a violation description, or ``None`` when the value is fine. The
+#: factories below (:func:`no_digits`, :func:`banned_patterns`, ...) each build
+#: one; :func:`field_invariant_leaks` runs a sequence of them over a corpus.
+FieldInvariant = Callable[[str, Mapping[str, Any]], str | None]
 
 #: NOTE on the card-number pattern's false-positive class: `\b(?:\d[ -]?){12,19}\b`
 #: matches any 12-19 CONSECUTIVE digits (optionally single-space/hyphen separated),
@@ -309,6 +316,440 @@ def paired_counterfactual_exemption(
         return True
 
     return exemption
+
+
+def fuzzy_duplicate_leaks(
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    field: str,
+    threshold: float = 0.995,
+    group_fn: Callable[[Mapping[str, Any]], Any] | None = None,
+    splits_checked: Sequence[str] = ("train", "validation"),
+) -> dict[str, Any]:
+    """Flag pairs of rows whose normalized ``field`` values are *nearly* -- but
+    not exactly -- the same.
+
+    Exact duplicates are :func:`duplicate_text_leaks`' job and are deliberately
+    skipped here, so the two checks partition the problem instead of both
+    reporting the same bucket. What this one catches is the pair an exact-match
+    check cannot see: two rows a generator emitted from one template that differ
+    by a comma, a name, or a trailing word. At training scale those are the same
+    example twice -- the model gets the repetition without the variety the second
+    row was supposed to buy.
+
+    Comparison is within one split (a cross-split near-duplicate is a leak
+    question, answered by :func:`secondary_field_leaks`) and, when ``group_fn``
+    is given, within one group: ``group_fn(row)`` returns the group key, and only
+    rows sharing it are compared. That is what keeps the O(n^2) pass affordable
+    -- group by the scenario family, or whatever partition makes two rows
+    comparable at all, and the quadratic term is per family rather than per
+    corpus. The default puts every row of a split in one group.
+
+    Values are compared after :func:`dataforge.rows.normalize_text`; rows whose
+    ``field`` is missing, non-``str`` or blank are skipped. ``ratio`` is
+    ``difflib.SequenceMatcher.ratio()`` rounded to four places, and the cheap
+    ``real_quick_ratio``/``quick_ratio`` upper bounds short-circuit the expensive
+    comparison first.
+
+    The key is ``fuzzy_duplicate_leaks`` (entries ``{"split", "group",
+    "index_a", "index_b", "ratio"}``, the indexes being positions in that
+    split's row sequence), so it gates via :func:`dataforge.emit.default_gates`
+    like every other ``*_leaks`` key.
+    """
+    if not 0.0 < threshold <= 1.0:
+        raise ValueError(f"fuzzy_duplicate_leaks: threshold must be in (0, 1], got {threshold!r}")
+    leaks: list[dict[str, Any]] = []
+    for split, rows in splits.items():
+        if split not in splits_checked:
+            continue
+        groups: dict[Any, list[tuple[int, str]]] = {}
+        for index, row in enumerate(rows):
+            value = row.get(field)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            normalized = normalize_text(value)
+            if not normalized:
+                continue
+            key = "" if group_fn is None else group_fn(row)
+            groups.setdefault(key, []).append((index, normalized))
+        for group, members in groups.items():
+            for position, (index_a, value_a) in enumerate(members):
+                for index_b, value_b in members[position + 1 :]:
+                    if value_a == value_b:
+                        continue
+                    matcher = SequenceMatcher(a=value_a, b=value_b, autojunk=False)
+                    if matcher.real_quick_ratio() < threshold:
+                        continue
+                    if matcher.quick_ratio() < threshold:
+                        continue
+                    ratio = matcher.ratio()
+                    if ratio < threshold:
+                        continue
+                    leaks.append(
+                        {
+                            "split": split,
+                            "group": str(group),
+                            "index_a": index_a,
+                            "index_b": index_b,
+                            "ratio": round(ratio, 4),
+                        }
+                    )
+    return {"fuzzy_duplicate_leaks": leaks}
+
+
+def _normalized_unique(values: Iterable[str]) -> list[str]:
+    """Normalized, non-blank, order-preserving and de-duplicated."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = normalize_text(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def probe_exclusion_leaks(
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    probes: Iterable[str] = (),
+    fragments: Iterable[str] = (),
+    fields: Sequence[str] = ("text",),
+    splits_checked: Sequence[str] = ("train", "validation"),
+) -> dict[str, Any]:
+    """Flag training text that reproduces an evaluation probe.
+
+    An evaluation probe is only held out if something proves it was held out.
+    Without a gate, "the model passed the probe" is a claim about memorization
+    as easily as about generalization, and nothing in the build can tell the two
+    apart after the fact. This is the gate: run it over the trainable splits
+    with the probes the model will be scored on, and a probe that made its way
+    into training fails the build instead of flattering the eval.
+
+    ``probes`` are whole probe texts: a row leaks when a checked field's
+    normalized value **equals** a normalized probe. ``fragments`` are the
+    shorter distinctive phrases a probe is recognizable by (a paraphrased probe
+    keeps them even when the whole text no longer matches): a row leaks when a
+    normalized field value **contains** a normalized fragment. Both are matched
+    on :func:`dataforge.rows.normalize_text`, so casing, punctuation and spacing
+    do not hide a leak. Passing neither raises -- a probe gate with nothing to
+    look for would pass vacuously, which is the failure it exists to prevent.
+
+    ``fields`` decides the surface: the row's own utterance field catches an
+    exact probe, while a rendered-transcript field also catches a probe phrase
+    that arrived through a context turn. ``splits_checked`` defaults to the
+    trainable splits, so the probes' own frozen split is exempt by construction.
+
+    The key is ``probe_exclusion_leaks`` (entries ``{"split", "index", "field",
+    "kind", "value"}``, where ``kind`` is ``"probe"`` or ``"fragment"`` and
+    ``value`` is the normalized probe or fragment that matched).
+    """
+    normalized_probes = _normalized_unique(probes)
+    normalized_fragments = _normalized_unique(fragments)
+    if not normalized_probes and not normalized_fragments:
+        raise ValueError(
+            "probe_exclusion_leaks: pass probes and/or fragments -- a probe gate with nothing "
+            "to look for passes vacuously"
+        )
+    probe_set = set(normalized_probes)
+    leaks: list[dict[str, Any]] = []
+    for split, rows in splits.items():
+        if split not in splits_checked:
+            continue
+        for index, row in enumerate(rows):
+            for field in fields:
+                value = row.get(field)
+                if not isinstance(value, str):
+                    continue
+                normalized = normalize_text(value)
+                if not normalized:
+                    continue
+                if normalized in probe_set:
+                    leaks.append(
+                        {
+                            "split": split,
+                            "index": index,
+                            "field": field,
+                            "kind": "probe",
+                            "value": normalized,
+                        }
+                    )
+                for fragment in normalized_fragments:
+                    if fragment in normalized:
+                        leaks.append(
+                            {
+                                "split": split,
+                                "index": index,
+                                "field": field,
+                                "kind": "fragment",
+                                "value": fragment,
+                            }
+                        )
+    return {"probe_exclusion_leaks": leaks}
+
+
+def _invariant_name(invariant: FieldInvariant) -> str:
+    """The label an invariant reports under.
+
+    The factories below set ``__name__`` to their own name, or to the caller's
+    ``label`` where one is given, so a finding says which invariant fired rather
+    than printing a closure's repr.
+    """
+    name = getattr(invariant, "__name__", "")
+    return str(name) if name else repr(invariant)
+
+
+def no_digits() -> FieldInvariant:
+    """The value must contain no decimal digit.
+
+    The invariant behind "never invent an account number": a hand-authored
+    behaviour curriculum teaches a *mapping*, and a stray digit in one of its
+    frames is a fact the model has no way to know is fictional.
+    """
+
+    def invariant(value: str, row: Mapping[str, Any]) -> str | None:
+        match = re.search(r"\d", value)
+        return None if match is None else f"contains the digit {match.group(0)!r}"
+
+    invariant.__name__ = "no_digits"
+    return invariant
+
+
+def no_questions() -> FieldInvariant:
+    """The value must contain no ``?``.
+
+    For a curriculum whose whole point is that the model *answers* rather than
+    deflects, a question mark in the taught response is the deflection.
+    """
+
+    def invariant(value: str, row: Mapping[str, Any]) -> str | None:
+        return "contains a question mark" if "?" in value else None
+
+    invariant.__name__ = "no_questions"
+    return invariant
+
+
+def banned_patterns(patterns: Sequence[re.Pattern[str] | str], *, label: str) -> FieldInvariant:
+    """No pattern in ``patterns`` may match the raw value.
+
+    Unlike :func:`banned_wording_leaks`, which sweeps a whole corpus for one
+    pattern, this is a per-row invariant meant to be composed with others in a
+    single :func:`field_invariant_leaks` pass. ``label`` names it in the report,
+    so several instances of this factory stay distinguishable.
+    """
+    if not label.strip():
+        raise ValueError("banned_patterns: label must be a non-empty string")
+    if not patterns:
+        raise ValueError(f"banned_patterns({label!r}): pass at least one pattern")
+    compiled = [
+        re.compile(pattern) if isinstance(pattern, str) else pattern for pattern in patterns
+    ]
+
+    def invariant(value: str, row: Mapping[str, Any]) -> str | None:
+        for pattern in compiled:
+            match = pattern.search(value)
+            if match is not None:
+                return f"matches {pattern.pattern!r} at {match.group(0)!r}"
+        return None
+
+    invariant.__name__ = label
+    return invariant
+
+
+def forbidden_terms(terms: Sequence[str], *, label: str) -> FieldInvariant:
+    """No term in ``terms`` may appear in the raw value, case-insensitively.
+
+    Substring matching, deliberately: the terms this exists for are internal
+    tool and system names that must never surface in text a customer reads, and
+    they are just as wrong glued to a punctuation mark as standing alone.
+    """
+    if not label.strip():
+        raise ValueError("forbidden_terms: label must be a non-empty string")
+    if not terms:
+        raise ValueError(f"forbidden_terms({label!r}): pass at least one term")
+    lowered = [term.lower() for term in terms]
+
+    def invariant(value: str, row: Mapping[str, Any]) -> str | None:
+        haystack = value.lower()
+        for term, original in zip(lowered, terms, strict=True):
+            if term in haystack:
+                return f"contains forbidden term {original!r}"
+        return None
+
+    invariant.__name__ = label
+    return invariant
+
+
+def required_markers(
+    markers_by_tag: Mapping[str, Sequence[str]],
+    *,
+    tag_fn: Callable[[Mapping[str, Any]], str],
+) -> FieldInvariant:
+    """Every marker registered for the row's tag must appear in the value.
+
+    ``tag_fn(row)`` picks the tag (an example kind, a behaviour key, a lane);
+    a tag with no entry in ``markers_by_tag`` passes, so one invariant can be
+    declared for the handful of tags that have a required phrasing without
+    constraining the rest. Both the value and each marker are compared under
+    :func:`dataforge.rows.normalize_text`, so a marker is not defeated by
+    punctuation or casing.
+
+    This is the positive counterpart to :func:`banned_patterns`: it is how a
+    curriculum states that a particular behaviour must actually *say* the thing
+    it exists to teach.
+    """
+    normalized_markers = {
+        tag: [normalize_text(marker) for marker in markers if normalize_text(marker)]
+        for tag, markers in markers_by_tag.items()
+    }
+
+    def invariant(value: str, row: Mapping[str, Any]) -> str | None:
+        tag = tag_fn(row)
+        markers = normalized_markers.get(tag)
+        if not markers:
+            return None
+        normalized = normalize_text(value)
+        for marker in markers:
+            if marker not in normalized:
+                return f"tag {tag!r} requires the marker {marker!r}"
+        return None
+
+    invariant.__name__ = "required_markers"
+    return invariant
+
+
+def min_word_count(n: int) -> FieldInvariant:
+    """The value must carry at least ``n`` whitespace-separated words."""
+    if n < 1:
+        raise ValueError(f"min_word_count: n must be at least 1, got {n!r}")
+
+    def invariant(value: str, row: Mapping[str, Any]) -> str | None:
+        words = len(value.split())
+        return None if words >= n else f"has {words} words, needs {n}"
+
+    invariant.__name__ = "min_word_count"
+    return invariant
+
+
+def field_invariant_leaks(
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    field: str,
+    invariants: Sequence[FieldInvariant],
+    row_predicate: Callable[[Mapping[str, Any]], bool] | None = None,
+    splits_checked: Sequence[str] = ("train", "validation"),
+) -> dict[str, Any]:
+    """Run per-row invariants over one field and report every violation.
+
+    These are meant to be wired through ``compose(pre_dedup_checks=...)``, not
+    ``extra_leak_checks``: a violating row must fail the build *before* dedup
+    can drop it. Dedup runs on the text field before the report is built, so a
+    row that breaks an invariant and happens to duplicate a clean sibling would
+    otherwise disappear -- and the build would pass on the strength of the row
+    that survived rather than the row that was wrong.
+
+    ``invariants`` is a sequence of callables ``(value, row) -> str | None``;
+    the factories in this module (:func:`no_digits`, :func:`no_questions`,
+    :func:`banned_patterns`, :func:`forbidden_terms`, :func:`required_markers`,
+    :func:`min_word_count`) build the common ones, and any callable with a
+    ``__name__`` works. Each is run against every checked row, so one pass
+    reports every broken invariant instead of only the first.
+
+    ``row_predicate`` scopes the check to the rows an invariant is *about* --
+    a hand-authored behaviour curriculum's rows normally hold to rules the rest
+    of the corpus does not. Raises ``ValueError`` when ``field`` is absent from
+    every checked row, so a typo fails loudly instead of passing vacuously, and
+    when ``invariants`` is empty, since a check that cannot fire is a disarmed
+    gate that still reports a reassuring zero.
+
+    The key is ``field_invariant_leaks`` (entries ``{"split", "index",
+    "invariant", "detail"}``).
+    """
+    if not invariants:
+        raise ValueError(f"field_invariant_leaks({field!r}): pass at least one invariant")
+    checked = [(split, rows) for split, rows in splits.items() if split in splits_checked]
+    rows_seen = any(rows for _, rows in checked)
+    field_seen = any(field in row for _, rows in checked for row in rows)
+    if rows_seen and not field_seen:
+        raise ValueError(
+            f"field_invariant_leaks: field {field!r} is absent from every checked row"
+        )
+
+    leaks: list[dict[str, Any]] = []
+    for split, rows in checked:
+        for index, row in enumerate(rows):
+            if row_predicate is not None and not row_predicate(row):
+                continue
+            value = row.get(field)
+            if not isinstance(value, str):
+                continue
+            for invariant in invariants:
+                detail = invariant(value, row)
+                if detail is not None:
+                    leaks.append(
+                        {
+                            "split": split,
+                            "index": index,
+                            "invariant": _invariant_name(invariant),
+                            "detail": detail,
+                        }
+                    )
+    return {"field_invariant_leaks": leaks}
+
+
+def unsupported_claim_leaks(
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    field: str,
+    claim_patterns: Sequence[re.Pattern[str] | str],
+    evidence_fn: Callable[[Mapping[str, Any]], bool],
+    row_predicate: Callable[[Mapping[str, Any]], bool] | None = None,
+    splits_checked: Sequence[str] = ("train", "validation"),
+) -> dict[str, Any]:
+    """Flag rows that claim a completed action without evidence of one.
+
+    A final response asserting "I have frozen the card" on a row that carries no
+    tool call teaches the model that the sentence is what an account action
+    looks like -- so it produces the sentence when it has done nothing, which is
+    the most expensive failure a servicing model has. The rule "no evidence, no
+    claim" is easy to state and impossible to hold to by review alone; this is
+    what makes it enforceable at build time.
+
+    ``claim_patterns`` are the regexes that recognize a completed-action claim
+    in ``field``. ``evidence_fn(row)`` answers whether the row actually carries
+    the evidence -- normally "does this row have tool-call turns", but the
+    caller owns the definition, because what counts as evidence is the row
+    schema's business. A row is flagged once per matching pattern when
+    ``evidence_fn`` is ``False``; a claim backed by evidence is exactly what the
+    dataset is for and is never flagged.
+
+    The key is ``unsupported_claim_leaks`` (entries ``{"split", "index",
+    "pattern"}``).
+    """
+    if not claim_patterns:
+        raise ValueError(f"unsupported_claim_leaks({field!r}): pass at least one claim pattern")
+    compiled = [
+        re.compile(pattern) if isinstance(pattern, str) else pattern for pattern in claim_patterns
+    ]
+    leaks: list[dict[str, Any]] = []
+    for split, rows in splits.items():
+        if split not in splits_checked:
+            continue
+        for index, row in enumerate(rows):
+            if row_predicate is not None and not row_predicate(row):
+                continue
+            value = row.get(field)
+            if not isinstance(value, str):
+                continue
+            matched = [pattern for pattern in compiled if pattern.search(value) is not None]
+            if not matched or evidence_fn(row):
+                continue
+            leaks.extend(
+                {"split": split, "index": index, "pattern": pattern.pattern}
+                for pattern in matched
+            )
+    return {"unsupported_claim_leaks": leaks}
 
 
 def secondary_field_leaks(
