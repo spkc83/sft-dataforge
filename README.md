@@ -31,8 +31,8 @@ generated `README.md` data card, a `source.lock.json`, and the teacher
 request/response jsonl pair. The build is deterministic: run it twice into
 different directories and the files are byte-identical.
 
-The second example builds tool-calling **conversation** rows and exercises
-every guard and check described below:
+The second example builds tool-calling **conversation** rows and wires the
+guards and checks a governed conversation build needs:
 
 ```bash
 uv run python -m examples.banking.build_tool_calls dist/banking-tool-calls-example
@@ -45,10 +45,11 @@ pipeline with a stubbed teacher.
 
 ## Design principles
 
-- **The deterministic skeleton owns labels.** A `Taxonomy` is a declarative
-  dict (dimensions, an intent-to-hierarchy mapping, and the legal
-  `(action, entity_resolution)` pairs per lane) rather than a python module
-  full of domain constants. Curricula compute *which* label a given example
+- **The deterministic skeleton owns labels.** A `Taxonomy` is a frozen
+  dataclass built from a plain dict or JSON file (dimensions, an
+  intent-to-hierarchy mapping, and the legal `(action, entity_resolution)`
+  pairs per value of the gate dimension) rather than a python module full of
+  domain constants. Curricula compute *which* label a given example
   gets; the taxonomy only validates that the result is internally
   consistent. This keeps label logic auditable and testable independent of
   any specific domain.
@@ -64,10 +65,12 @@ pipeline with a stubbed teacher.
   silently inflates apparent performance.
 - **Gates before emission, not after.** `dataforge.emit.write_dataset` runs
   its gate functions against the composed report *before* writing any file.
-  The default gate aborts on any nonzero PII match count or nonempty
-  leakage finding; new leakage checks in `dataforge.guards` gate
-  automatically because the default gate walks the report by key suffix
-  (`_leak_count`, `_leaks`) rather than an enumerated list.
+  `default_gates` aborts on any nonzero PII match count or nonempty leakage
+  finding; a new check in `dataforge.guards` gates automatically because that
+  gate walks `report["leakage"]` by key suffix (`_leak_count`, `_leaks`)
+  rather than an enumerated list. It walks that sub-report and nothing else,
+  which is why a finding computed outside `compose` has to be carried in
+  through `build_report(extra_leakage=...)` to gate at all.
 - **Locks and manifests for provenance.** Every emitted split gets a
   canonical (sorted-key) jsonl encoding and a sha256 in `manifest.json`.
   `dataforge.emit.write_source_lock` / `verify_release_split_digests` let a
@@ -78,19 +81,35 @@ pipeline with a stubbed teacher.
 
 | Module | Responsibility |
 | --- | --- |
-| `dataforge/taxonomy.py` | `Taxonomy` dataclass (built from a dict/JSON): intent hierarchy, legal action/entity-resolution pairs per lane, tool compatibility. `labels_for_example` / `validate_hierarchical_labels`. |
-| `dataforge/rows.py` | The row contract: `render_context` (the `[PRIOR_STATE]` / `[CURRENT_USER]` / `[PREVIOUS_ASSISTANT]` / `[PREVIOUS_USER]` flattening), `make_row` (labels + multi-hot relations + provenance), `make_conversation_row`, `normalize_text`. |
+| `dataforge/taxonomy.py` | `Taxonomy`, a frozen dataclass with `from_dict`/`from_json`: intent hierarchy, legal action/entity-resolution pairs per value of the configurable `gate_dimension`, tool compatibility. `labels_for_example` / `validate_hierarchical_labels`. |
+| `dataforge/rows.py` | The row contract: `render_context` (the `[PRIOR_STATE]` / `[CURRENT_USER]` / `[PREVIOUS_ASSISTANT]` / `[PREVIOUS_USER]` flattening), `make_row` (labels, multi-hot relations, and the governance identifiers), `make_conversation_row`, `normalize_text`. |
 | `dataforge/curricula.py` | `@curriculum` registration on a `Registry`; `compose` runs every curriculum per split, enforces group/trajectory/pair non-leakage, deduplicates with eval-wins ordering, and produces the governance report. Also `BehaviourSeed`/`behaviour_rows` and the `uses` tag with `foreign_use_rows`. |
-| `dataforge/guards.py` | PII regexes, held-out exact + n-gram leak detection, `leakage_report`; the duplicate and near-duplicate guards, and the build-time invariant guards (`field_invariant_leaks` and its primitives, `probe_exclusion_leaks`, `unsupported_claim_leaks`). |
-| `dataforge/emit.py` | Canonical jsonl encoding, `write_dataset` (gates, split files, manifest, data card), `write_source_lock`, `verify_release_split_digests`. |
+| `dataforge/guards.py` | PII regexes, held-out exact + n-gram leak detection, `leakage_report`, `secondary_field_leaks`, `banned_wording_leaks`; the duplicate and near-duplicate guards, and the build-time invariant guards (`field_invariant_leaks` and its primitives, `probe_exclusion_leaks`, `unsupported_claim_leaks`). |
+| `dataforge/emit.py` | Canonical jsonl encoding, `write_dataset` (gates, staleness check, split files, manifest, data card), `default_gates`, `write_source_lock`, `verify_release_split_digests`. |
 | `dataforge/teacher.py` | `immutable_hash`, `export_teacher_requests`, `import_teacher_responses`, `scrub_fields`, `compute_teacher_prompt_hash` -- the wording-only teacher realization harness. |
-| `dataforge/checks.py` | The teacher-batch checker: `check_teacher_batch` over a `Batch` of request/response/record triples, and the generic rule factories (`hash_pinned`, `min_words`, `banned_pattern`, `unique_normalized`, `opening_ngram_cap`, ...). |
+| `dataforge/checks.py` | The teacher-batch checker: `check_teacher_batch(requests, responses, records, rules)`, where the first two are jsonl paths, and the generic rule factories (`hash_pinned`, `min_words`, `banned_pattern`, `unique_normalized`, `opening_ngram_cap`, ...). Rules see a `Batch` of matched `Pair` triples. |
 
 ## Row shapes
 
 `rows.make_row` builds the classifier row: hierarchical labels from the
-taxonomy, multi-hot relations, provenance, and a `text` derived by
-`render_context` from the prior dialogue state and the surrounding turns.
+taxonomy, multi-hot relations, and a `text` derived by `render_context` from
+the prior dialogue state and the surrounding turns.
+
+Every row also carries the identifiers the governance checks run on, and a
+curriculum has to supply them:
+
+| field | what it identifies |
+| --- | --- |
+| `group_id` | the family of rows generated together; a group may not straddle splits |
+| `trajectory_id` | the conversation a multi-turn row belongs to; defaults to `group_id` |
+| `pair_id` / `pair_target` / `pair_family` | the two halves of a counterfactual pair and what distinguishes them |
+| `source` / `source_split` | where the row came from and which split its source assigned it |
+| `example_kind` | the curriculum's own label for the shape of the example |
+
+`compose` raises when one of these straddles a split, so an absent or reused
+identifier is a build failure rather than a silent leak. None of them is the
+`provenance` field discussed under the teacher boundary: that key does not
+exist until `import_teacher_responses` or `scrub_fields` writes it.
 
 `rows.make_conversation_row` builds a tool-calling row whose source of truth
 is four fields -- `context_messages`, `user_text`, `action_turns`,
@@ -112,26 +131,29 @@ lists `final_response` among its sources, so with
 projection excludes exactly `{final_response, messages}` (`provenance` is
 excluded unconditionally, for the reason given under the teacher boundary).
 Change a tool name, an argument, a result envelope, a context turn or a label
-and the hash moves. Callers must pass
-`rederive=rederive_conversation` and `validate=validate_conversation_row` to
-both teacher entry points, because the derived-field map is non-default and
-the library cannot infer it.
+and the hash moves.
 
-Two knobs a conversation build has to set. `text` renders context and user
-turns only, never tool calls, so two rows sharing a context and a user turn
-but calling different tools render the same `text`; deduplicate on `user_text`
-through `pre_dedup_checks` rather than leaning on `text`. And
-`compose`/`build_report` default `secondary_leak_fields` to
-`("current_text",)`, which is the classifier row's field, while
-`secondary_field_leaks` raises on a field absent from every row -- so pass
-`secondary_leak_fields=("user_text",)`, as the example does.
+Getting that projection requires passing
+`derived_fields=CONVERSATION_DERIVED_FIELDS` to both teacher entry points,
+together with `rederive=rederive_conversation` and
+`validate=validate_conversation_row`. `derived_fields` defaults to the
+classifier map, under which no derived field depends on `final_response`, so
+omitting it silently narrows the exclusion set to `{final_response}` alone,
+leaves `messages` inside the hash, and makes `rederive` move it. The import
+then fails with "changed immutable semantics", which reads like a misbehaving
+teacher rather than a wiring mistake.
 
 ## Curricula
 
 A curriculum is a function registered on a `Registry` that returns rows for a
-given split. `compose` runs every registered curriculum per split, enforces
-group, trajectory and pair non-leakage, deduplicates with eval-wins ordering,
-and returns both the rows and a governance report.
+given split. `compose(seed_splits, registry, ...)` drives them. `seed_splits`
+is the starting map of split name to rows; a build with no pre-existing rows
+passes an empty list per split, which is what both examples do. Every key in
+it, and every split any curriculum targets, must appear in `split_order` or
+`compose` raises rather than dropping rows silently.
+Rows accumulate per split, seed rows first and then curriculum rows, and seed
+rows are never `use`-filtered because they did not come from a curriculum that
+could declare a `uses` policy.
 
 ### Repeating one behaviour across frames, with subjects held back
 
@@ -141,7 +163,7 @@ states such a behaviour once: `frames` are the ways a customer might raise it,
 `finals` the matching responses, and `subjects` the things it is raised about,
 keyed by split. `curricula.behaviour_rows(seeds, split, row_fn=...)` expands it
 -- every frame of every train subject, and the first
-`frames_per_validation_subject` frames for any other split.
+`frames_per_validation_subject` frames (default 2) for any other split.
 
 The subjects a non-train split uses must be disjoint from train's;
 `behaviour_rows` raises rather than trusting it, because a behaviour scored on
@@ -212,7 +234,9 @@ never see a build they rejected. Their keys are still merged into
 recompute a pre-dedup finding, `build_report(extra_leakage=...)` is how a caller
 carries those keys into the report it actually emits, so the manifest records
 that the gate ran. `compose` also reports `within_split_duplicates_removed` as a
-sub-count of `cross_split_duplicates_removed`; neither gates.
+sub-count of `cross_split_duplicates_removed`; neither gates. The outer counter
+covers removals of both kinds despite its name, which is held stable so that a
+caller reading it does not see the number change meaning underneath them.
 
 ### Field invariants
 
@@ -269,7 +293,40 @@ the quadratic term ends up per family instead of per corpus, and the cheap
 `real_quick_ratio`/`quick_ratio` bounds short-circuit before `ratio()`. A
 cross-split near-duplicate is consequently covered by nothing here --
 `secondary_field_leaks` buckets on exact normalized equality and will not see it
-either.
+either. `splits_checked` also defaults to the trainable splits, so a frozen
+evaluation split is not scanned for near-duplicates at all unless you name it.
+
+### Wiring a conversation build
+
+Four guard defaults are written for the classifier row and have to be
+overridden when the rows are conversations. Each of them fails quietly rather
+than loudly, so they are worth setting before the first build.
+
+| setting | default | pass instead |
+| --- | --- | --- |
+| `secondary_leak_fields` on `compose`/`build_report` | `("current_text",)` | `("user_text",)`, or `secondary_field_leaks` raises on a field no row has |
+| `context_fields` on `paired_counterfactual_exemption` | `("history",)` | `("context_messages",)`, or the structural proof compares two empty projections and the exemption cannot be earned |
+| `text_fields` on `banned_wording_leaks` | `("text",)` | `()` alongside `message_fields=("messages",)`, since `text` is the flattened context and user turn and every hit there would otherwise be reported twice |
+| the field you deduplicate on | `text` | `user_text` through `pre_dedup_checks`, because `text` omits tool calls and two rows calling different tools render identically |
+
+## Emission
+
+`emit.write_dataset` writes `{split}.jsonl` in a canonical sorted-key encoding,
+a `manifest.json` carrying each split's sha256, and a `README.md` data card
+from lines the caller supplies. Gates run first, against the report, and a
+raising gate leaves no file behind.
+
+Before the gates it checks that the report is not stale. `build_report` stamps
+a `splits_fingerprint` over the rows it saw, `write_dataset` recomputes it over
+the rows it is about to write, and a mismatch raises. A report that matches the
+expected contract but carries no fingerprint at all raises as well, because
+`build_report` always sets one and its absence means the report came from
+somewhere that cannot vouch for freshness. This is what forces a rebuild after
+a teacher pass: the realized rows are not the rows the first report described.
+
+`write_source_lock` pins a release's split digests to a file, and
+`verify_release_split_digests` compares a later build against it, which is how
+a pipeline detects that a corpus moved without anyone saying so.
 
 ## The teacher boundary
 
@@ -331,8 +388,13 @@ only). Domain rules stay in the caller.
 ## Worked examples
 
 `examples/banking/curricula.py` and `examples/banking/build.py` cover the
-classifier path. The tool-calling path is separate and wires every guard and
-check above.
+classifier path. The tool-calling path is separate.
+
+The examples are a working integration, not an exhaustive demonstration. The
+near-duplicate guard, the `forbidden_terms`, `required_markers` and
+`min_word_count` invariant primitives, and the `untouched_field`,
+`max_sentences` and `preserved_literals` rules are exercised in `tests/`
+rather than in a build. Read the tests for those.
 
 `examples/banking/tool_curricula.py` holds the rows: single-turn `freeze_card`
 and `list_cards` calls, a multi-turn row whose context contains its own
