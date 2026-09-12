@@ -34,6 +34,14 @@ PII_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+#: The trainable splits every guard defaults to. A module-level constant so
+#: :func:`_require_known_splits` can tell "the caller relied on the default"
+#: from "the caller named these splits" by identity, and validate only the
+#: second. A tuple literal at each call site would make the two cases
+#: indistinguishable.
+DEFAULT_TRAINABLE_SPLITS: tuple[str, ...] = ("train", "validation")
+
+
 def count_pii_matches(
     texts: Iterable[str], *, patterns: Sequence[re.Pattern[str]] = PII_PATTERNS
 ) -> int:
@@ -115,7 +123,7 @@ def banned_wording_leaks(
     text_fields: Sequence[str] = ("text",),
     message_fields: Sequence[str] = (),
     message_roles: Collection[str] = ("user", "assistant"),
-    trainable_splits: Sequence[str] = ("train", "validation"),
+    trainable_splits: Sequence[str] = DEFAULT_TRAINABLE_SPLITS,
     group_field: str = "group_id",
 ) -> dict[str, Any]:
     """Flag banned wording anywhere in the *trainable* text of ``splits``.
@@ -140,6 +148,7 @@ def banned_wording_leaks(
     or ``pre_dedup_checks`` gates the build via
     :func:`dataforge.emit.default_gates` with no other change.
     """
+    _require_known_splits("banned_wording_leaks", splits, trainable_splits)
     compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
     leaks: list[dict[str, str]] = []
 
@@ -216,6 +225,8 @@ def duplicate_text_leaks(
     ``{"normalized", "members": [{"split", "group_id"}]}``) and
     ``{field}_duplicate_leak_count``.
     """
+    if splits_in_scope is not None:
+        _require_known_splits("duplicate_text_leaks", splits, splits_in_scope)
     in_scope = set(splits) if splits_in_scope is None else set(splits_in_scope)
     buckets: dict[str, list[dict[str, Any]]] = {}
     for split, rows in splits.items():
@@ -324,7 +335,7 @@ def fuzzy_duplicate_leaks(
     field: str,
     threshold: float = 0.995,
     group_fn: Callable[[Mapping[str, Any]], Any] | None = None,
-    splits_checked: Sequence[str] = ("train", "validation"),
+    splits_checked: Sequence[str] = DEFAULT_TRAINABLE_SPLITS,
 ) -> dict[str, Any]:
     """Flag pairs of rows whose normalized ``field`` values are *nearly* -- but
     not exactly -- the same.
@@ -367,6 +378,7 @@ def fuzzy_duplicate_leaks(
     like every other ``*_leaks`` key. There is deliberately no ``_leak_count``
     companion: the list alone gates, and a second key could only disagree with it.
     """
+    _require_known_splits("fuzzy_duplicate_leaks", splits, splits_checked)
     if not 0.0 < threshold <= 1.0:
         raise ValueError(f"fuzzy_duplicate_leaks: threshold must be in (0, 1], got {threshold!r}")
     leaks: list[dict[str, Any]] = []
@@ -406,6 +418,40 @@ def fuzzy_duplicate_leaks(
                         }
                     )
     return {"fuzzy_duplicate_leaks": leaks}
+
+
+def _require_known_splits(
+    guard: str,
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    requested: Sequence[str],
+) -> None:
+    """Raise when none of the requested split names exists in ``splits``.
+
+    The companion to :func:`_require_field_present`, and the same argument: a
+    guard asked to scan ``("trian",)`` scans nothing and reports a clean zero,
+    which is indistinguishable from a corpus that is genuinely clean. This
+    module already raises on a field-name typo, so validating one name and not
+    the other is the worse of the two available inconsistencies.
+
+    Only names the caller passed explicitly are checked. The defaults are
+    skipped by identity, because a corpus legitimately holding one split is
+    ordinary -- scanning a frozen test split on its own is a real call, and so
+    is a corpus with no validation split -- and raising there would reject
+    correct code. A name the caller typed is different: they believed it was in
+    the corpus, and it is not. An empty ``splits`` carries no signal either way.
+    """
+
+    if not splits or requested is DEFAULT_TRAINABLE_SPLITS:
+        return
+    unknown = [name for name in requested if name not in splits]
+    if not unknown:
+        return
+    names = ", ".join(repr(name) for name in unknown)
+    known = ", ".join(repr(name) for name in sorted(splits))
+    raise ValueError(
+        f"{guard}: requested split(s) {names} are not in this corpus, which has {known}; "
+        f"the check would silently scan nothing"
+    )
 
 
 def _require_field_present(
@@ -451,7 +497,7 @@ def probe_exclusion_leaks(
     probes: Iterable[str] = (),
     fragments: Iterable[str] = (),
     fields: Sequence[str] = ("text",),
-    splits_checked: Sequence[str] = ("train", "validation"),
+    splits_checked: Sequence[str] = DEFAULT_TRAINABLE_SPLITS,
 ) -> dict[str, Any]:
     """Flag training text that reproduces an evaluation probe.
 
@@ -489,6 +535,7 @@ def probe_exclusion_leaks(
     deliberately no ``_leak_count`` companion: the list alone gates, and a
     second key could only disagree with it.
     """
+    _require_known_splits("probe_exclusion_leaks", splits, splits_checked)
     normalized_probes = _normalized_unique(probes)
     normalized_fragments = _normalized_unique(fragments)
     if not normalized_probes and not normalized_fragments:
@@ -695,7 +742,7 @@ def field_invariant_leaks(
     field: str,
     invariants: Sequence[FieldInvariant],
     row_predicate: Callable[[Mapping[str, Any]], bool] | None = None,
-    splits_checked: Sequence[str] = ("train", "validation"),
+    splits_checked: Sequence[str] = DEFAULT_TRAINABLE_SPLITS,
 ) -> dict[str, Any]:
     """Run per-row invariants over one field and report every violation.
 
@@ -724,6 +771,7 @@ def field_invariant_leaks(
     "invariant", "detail"}``). There is deliberately no ``_leak_count``
     companion: the list alone gates, and a second key could only disagree with it.
     """
+    _require_known_splits("field_invariant_leaks", splits, splits_checked)
     if not invariants:
         raise ValueError(f"field_invariant_leaks({field!r}): pass at least one invariant")
     checked = [(split, rows) for split, rows in splits.items() if split in splits_checked]
@@ -758,7 +806,7 @@ def unsupported_claim_leaks(
     claim_patterns: Sequence[re.Pattern[str] | str],
     evidence_fn: Callable[[Mapping[str, Any]], bool],
     row_predicate: Callable[[Mapping[str, Any]], bool] | None = None,
-    splits_checked: Sequence[str] = ("train", "validation"),
+    splits_checked: Sequence[str] = DEFAULT_TRAINABLE_SPLITS,
 ) -> dict[str, Any]:
     """Flag rows that claim a completed action without evidence of one.
 
@@ -800,8 +848,7 @@ def unsupported_claim_leaks(
             if not matched or evidence_fn(row):
                 continue
             leaks.extend(
-                {"split": split, "index": index, "pattern": pattern.pattern}
-                for pattern in matched
+                {"split": split, "index": index, "pattern": pattern.pattern} for pattern in matched
             )
     return {"unsupported_claim_leaks": leaks}
 

@@ -183,6 +183,16 @@ def _read_all(paths: Path | str | Sequence[Path | str]) -> list[dict[str, Any]]:
     return [row for path in _as_paths(paths) for row in _read_rows(path)]
 
 
+#: The key a teacher request or response row carries its id under. A literal,
+#: because that is what :mod:`dataforge.teacher` writes and reads: both entry
+#: points take the *value* from ``record[record_id_field]`` but always put it on
+#: the wire as ``record_id``. Applying ``record_id_field`` to wire rows as well
+#: made one parameter name mean "the record's key" in one module and "the wire's
+#: key" in the other, so any non-default value matched nothing and the batch
+#: came back with every response unmatched.
+WIRE_ID_FIELD = "record_id"
+
+
 def _row_id(row: Mapping[str, Any], record_id_field: str) -> str | None:
     value = row.get(record_id_field)
     if not isinstance(value, str) or not value.strip():
@@ -228,7 +238,7 @@ def build_batch(
 
     requests_by_id: dict[str, Mapping[str, Any]] = {}
     for row in request_rows:
-        record_id = _row_id(row, record_id_field)
+        record_id = _row_id(row, WIRE_ID_FIELD)
         if record_id is not None:
             requests_by_id[record_id] = row
 
@@ -242,7 +252,7 @@ def build_batch(
     pairs: list[Pair] = []
     seen: set[str] = set()
     for row in response_rows:
-        record_id = _row_id(row, record_id_field)
+        record_id = _row_id(row, WIRE_ID_FIELD)
         if record_id is None:
             findings.append(Finding(UNKNOWN_RECORD_ID, "input", "row has no record_id"))
             continue

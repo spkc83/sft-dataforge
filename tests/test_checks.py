@@ -935,3 +935,33 @@ def test_summarize_reports_the_batch_shape(tmp_path: Path) -> None:
 def test_summarize_is_json_serializable(tmp_path: Path) -> None:
     batch = Batch(pairs=(), records={}, untouched=())
     assert json.loads(json.dumps(summarize(batch, [])))["checked"] == 0
+
+
+def test_a_non_default_record_id_field_still_matches_the_wire(tmp_path: Path) -> None:
+    """``record_id_field`` names the key on the RECORD, not on the wire.
+
+    ``dataforge.teacher`` reads the value from ``record[record_id_field]`` and
+    always writes it to the wire as ``record_id``. The checker used to apply
+    ``record_id_field`` to the wire rows as well, so any non-default value
+    matched nothing: every response came back "row has no record_id" and every
+    record came back untouched, which reads as a teacher problem rather than a
+    wiring one.
+    """
+
+    records = [{"example_id": "r1", "final_response": "Your card is frozen."}]
+    requests = tmp_path / "requests.jsonl"
+    responses = tmp_path / "responses.jsonl"
+    requests.write_text(
+        json.dumps({"record_id": "r1", "immutable_hash": "sha256:" + "0" * 64}) + "\n",
+        encoding="utf-8",
+    )
+    responses.write_text(
+        json.dumps({"record_id": "r1", "final_response": "Your card is now frozen."}) + "\n",
+        encoding="utf-8",
+    )
+
+    batch, findings = build_batch(requests, responses, records, record_id_field="example_id")
+
+    assert findings == []
+    assert [pair.record_id for pair in batch.pairs] == ["r1"]
+    assert batch.untouched == ()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -279,3 +280,37 @@ def test_verify_release_split_digests_uses_explicit_split_order() -> None:
 def test_report_contract_constant_matches_build_report() -> None:
     splits: dict[str, list[dict]] = {"train": [], "validation": [], "test": []}
     assert _clean_report(splits)["contract"] == REPORT_CONTRACT
+
+
+def _minimal_write(tmp_path: Path, **overrides: Any) -> dict[str, Any]:
+    splits: dict[str, list[dict]] = {
+        "train": [{"text": "freeze my card", "group_id": "g1"}],
+        "validation": [],
+        "test": [],
+    }
+    kwargs: dict[str, Any] = {
+        "splits": splits,
+        "report": _clean_report(splits),
+        "data_card_lines": ["# card"],
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+    kwargs.update(overrides)
+    return write_dataset(tmp_path / "out", **kwargs)
+
+
+def test_manifest_extra_may_not_replace_a_reserved_key(tmp_path: Path) -> None:
+    """The governance report is the artifact this framework exists to produce.
+
+    Spreading caller keys last let a caller who meant to add something replace
+    it instead, and the result still looked like a well-formed manifest.
+    """
+
+    with pytest.raises(ValueError, match="reserved manifest keys"):
+        _minimal_write(tmp_path, manifest_extra={"report": {"leakage": {}}})
+
+
+def test_manifest_extra_still_adds_its_own_keys(tmp_path: Path) -> None:
+    manifest = _minimal_write(tmp_path, manifest_extra={"taxonomy_version": "v3"})
+
+    assert manifest["taxonomy_version"] == "v3"
+    assert manifest["report"]["contract"] == REPORT_CONTRACT

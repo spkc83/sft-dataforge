@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from dataforge import guards
 from dataforge.guards import (
     banned_wording_leaks,
     contains_heldout_ngram,
@@ -142,9 +143,7 @@ def test_secondary_field_leaks_row_predicate_scopes_which_rows_count() -> None:
     )
     assert only_k1 == {}  # the test-split row is filtered out, so no cross-split pair remains
 
-    both = secondary_field_leaks(
-        splits, "current_text", row_predicate=lambda row: True
-    )
+    both = secondary_field_leaks(splits, "current_text", row_predicate=lambda row: True)
     assert both != {}
 
 
@@ -393,9 +392,7 @@ def test_duplicate_text_leaks_reports_a_bucket_whose_pair_has_a_missing_target()
     for row in splits["train"]:
         del row["_split"]
     del splits["train"][1]["pair_target"]
-    result = duplicate_text_leaks(
-        splits, "user_text", exempt=paired_counterfactual_exemption()
-    )
+    result = duplicate_text_leaks(splits, "user_text", exempt=paired_counterfactual_exemption())
     assert result["user_text_duplicate_leak_count"] == 1
     assert result["user_text_duplicate_leaks"][0]["members"] == [
         {"split": "train", "group_id": "g1"},
@@ -456,9 +453,7 @@ def test_duplicate_text_leaks_with_paired_counterfactual_exemption_end_to_end() 
     }
     for row in splits["train"]:
         del row["_split"]  # duplicate_text_leaks stamps it on the copies it hands to exempt
-    result = duplicate_text_leaks(
-        splits, "user_text", exempt=paired_counterfactual_exemption()
-    )
+    result = duplicate_text_leaks(splits, "user_text", exempt=paired_counterfactual_exemption())
     assert result["user_text_duplicate_leak_count"] == 0
 
 
@@ -485,3 +480,38 @@ def test_secondary_field_leaks_accepts_a_key_present_only_with_a_blank_value() -
 
 def test_secondary_field_leaks_on_entirely_empty_splits_is_not_an_error() -> None:
     assert secondary_field_leaks({"train": [], "test": []}, "current_text") == {}
+
+
+# The 2026-08-29 audit's finding 8: three fail-open paths, each of which turns
+# a mistake into a clean report rather than an error. A split-name typo is the
+# worst of them, because the same module raises rigorously on a field-name typo
+# and so reads as though it validates names in general.
+
+
+def test_a_split_name_typo_is_an_error_not_an_empty_check() -> None:
+    splits = {
+        "train": [{"text": "freeze my card", "group_id": "g1"}],
+        "test": [{"text": "freeze my card", "group_id": "g2"}],
+    }
+
+    for call in (
+        lambda: guards.banned_wording_leaks(splits, r"\bdemo\b", trainable_splits=("trian",)),
+        lambda: guards.duplicate_text_leaks(splits, field="text", splits_in_scope=("trian",)),
+        lambda: guards.probe_exclusion_leaks(splits, probes=("x",), splits_checked=("trian",)),
+        lambda: guards.fuzzy_duplicate_leaks(splits, field="text", splits_checked=("trian",)),
+        lambda: guards.field_invariant_leaks(
+            splits, field="text", invariants=[guards.no_digits()], splits_checked=("trian",)
+        ),
+    ):
+        with pytest.raises(ValueError, match="trian"):
+            call()
+
+
+def test_a_real_split_name_that_is_simply_absent_is_still_fine() -> None:
+    """A corpus without a validation split is not a typo, and must not raise."""
+
+    splits = {"train": [{"text": "freeze my card", "group_id": "g1"}]}
+
+    report = guards.duplicate_text_leaks(splits, field="text")
+
+    assert report["text_duplicate_leak_count"] == 0

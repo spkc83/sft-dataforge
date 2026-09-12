@@ -135,14 +135,24 @@ def write_dataset(
             }
         )
 
-    manifest = {
+    manifest: dict[str, Any] = {
         "contract": "dataforge-dataset-manifest",
         "row_format_version": row_format_version,
         "created_at": created_at,
         "splits": split_entries,
         "report": report,
-        **manifest_extra,
     }
+    # `report` is the artifact this framework exists to produce and `splits` is
+    # what a reader checks the files against. Spreading caller-supplied keys
+    # last let either be replaced by a caller who only meant to add something,
+    # and the result still looked like a well-formed manifest.
+    clobbered = sorted(set(manifest_extra) & set(manifest))
+    if clobbered:
+        names = ", ".join(repr(name) for name in clobbered)
+        raise ValueError(
+            f"write_dataset: manifest_extra may not replace reserved manifest keys ({names})"
+        )
+    manifest.update(manifest_extra)
     manifest_path = output_dir / "manifest.json"
     manifest_json = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     manifest_path.write_text(manifest_json, encoding="utf-8")
@@ -186,9 +196,7 @@ def verify_release_split_digests(
     if not isinstance(expected, Mapping) or not expected:
         raise ValueError("release lock is missing a non-empty prepared_split_sha256")
     actual = {str(entry["name"]): str(entry["sha256"]) for entry in split_entries}
-    canonical_splits = (
-        tuple(split_order) if split_order is not None else tuple(actual.keys())
-    )
+    canonical_splits = tuple(split_order) if split_order is not None else tuple(actual.keys())
     missing = [split for split in canonical_splits if split not in expected]
     if missing:
         raise ValueError(f"release lock is missing digests for splits: {missing}")
