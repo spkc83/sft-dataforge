@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "Governed instruction/SFT dataset construction for classifier and tool-calling fine-tuning"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Typing :: Typed",
+]
 dependencies = []
 
 [project.optional-dependencies]
@@ -21,6 +26,11 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["dataforge*"]
+
+# The library is mypy-clean, so ship the marker that lets a consumer's type
+# checker actually read its annotations. Without it the types are invisible.
+[tool.setuptools.package-data]
+dataforge = ["py.typed"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
